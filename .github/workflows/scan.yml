@@ -1,0 +1,38 @@
+name: scan
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+      - run: python scanner.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_KEY: ${{ secrets.TWELVEDATA_KEY }}
+          ACCOUNT_SIZE: ${{ secrets.ACCOUNT_SIZE }}
+          RISK_PERCENT: ${{ secrets.RISK_PERCENT }}
+          NEWS_BLACKOUTS: ${{ secrets.NEWS_BLACKOUTS }}
+          USE_CLAUDE: ${{ secrets.USE_CLAUDE }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
