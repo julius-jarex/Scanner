@@ -2,7 +2,7 @@
 """Daytrading-Scanner (Forex & Krypto): Kurse holen -> Setups per Regel finden -> Telegram.
 Standard: komplett kostenlos (nur Regeln). Optional: Claude als Zusatzfilter (USE_CLAUDE=1 + API-Key).
 Nur Hinweise, keine Orders. Aufruf: python scanner.py [--dry] [--test]"""
-import os, sys, json, time, argparse
+import os, sys, json, time, math, argparse
 from datetime import datetime, timezone, timedelta
 import requests
 import pandas as pd
@@ -24,6 +24,7 @@ MAX_SIGNALS_PER_DAY = 3        # höchstens so viele Meldungen pro 24 Stunden
 CORR_HOURS = 8                 # gleiche Marktrichtung (z. B. USD-short) nicht zweimal innerhalb 8 Stunden
 ERR_COOLDOWN_H = 6             # gleiche Fehlermeldung höchstens alle 6 Stunden
 HEARTBEAT_HOUR_UTC = 7         # tägliches Lebenszeichen ab 07:00 UTC
+TRADE_MAX_H = 30               # Meldung ohne TP1/Stop nach so vielen Stunden als "ohne Ergebnis" schließen
 # ---------------------------------------------------------------
 
 
@@ -106,10 +107,13 @@ def size(sym, entry, stop):
     risk = float(env("ACCOUNT_SIZE", 1000)) * float(env("RISK_PERCENT", 1)) / 100
     dist = abs(entry - stop)
     if sym in FOREX:
-        if sym == "XAUUSD": lots = risk / (dist * 100)
-        elif sym == "USDJPY": lots = risk / ((dist / 0.01) * (1000 / entry))
-        else: lots = risk / ((dist / 0.0001) * 10)
-        return f"{lots:.2f} Lots (Risiko {risk:.2f})"
+        if sym == "XAUUSD": per_lot = dist * 100                 # Verlust je 1 Lot bei Stop
+        elif sym == "USDJPY": per_lot = (dist / 0.01) * (1000 / entry)
+        else: per_lot = (dist / 0.0001) * 10
+        lots = math.floor(risk / per_lot * 100) / 100          # immer abrunden
+        if lots < 0.01:
+            return f"unter 0.01 Lots möglich (bei 0.01 Lots Risiko {per_lot * 0.01:.2f} statt {risk:.2f}), eher auslassen"
+        return f"{lots:.2f} Lots (Risiko ca. {lots * per_lot:.2f} von {risk:.2f})"
     return f"{risk / dist:.4f} {sym[:3]} (Risiko {risk:.2f}, ohne Hebel)"
 
 
@@ -134,7 +138,7 @@ def find_setups(sym, df):
         sgn = 1 if side == "long" else -1
         out.append({
             "id": f"{sym}|{name}|{side}", "symbol": sym, "setup": name, "side": side,
-            "candle_time": last.time.strftime("%Y-%m-%d %H:%M UTC"),
+            "candle_time": last.time.strftime("%Y-%m-%d %H:%M UTC"), "candle_ts": last.time.isoformat(),
             "entry": round(entry, 5), "stop": round(float(stop), 5),
             "tp1": round(entry + sgn * 2 * risk, 5), "tp2": round(entry + sgn * 3 * risk, 5),
             "htf_trend_1h": trend, "atr15": round(float(atr), 5),
@@ -309,7 +313,8 @@ def load_state():
 
 def save_state(s):
     now = time.time()
-    json.dump({k: v for k, v in s.items() if now - v < 86400}, open(STATE_FILE, "w"))
+    json.dump({k: v for k, v in s.items() if not isinstance(v, (int, float)) or now - v < 86400},
+              open(STATE_FILE, "w"))
 
 
 def format_msg(s, quality, text):
@@ -408,11 +413,99 @@ def heartbeat(state, now, checked, errors, dry):
     if now.hour >= HEARTBEAT_HOUR_UTC and time.time() - state.get("hb", 0) > 20 * 3600:
         n = len(sent_recent(state, 24))
         try:
-            telegram(f"💚 Scanner läuft. Letzte 24h: {n} Meldung(en). Aktuell {checked} Märkte geprüft, {errors} Fehler.\n"
-                     f"Bleibt diese Nachricht aus: GitHub → Actions prüfen (nach ~60 Tagen ohne Repo-Aktivität pausiert GitHub geplante Läufe).", dry)
+            lines = setup_lines(state)
+            telegram(f"💚 Scanner läuft. Letzte 24h: {n} Meldung(en). Aktuell {checked} Märkte geprüft, {errors} Fehler, "
+                     f"{len(state.get('_trades', []))} offene Meldung(en).\n{stats_line(state)}"
+                     + (f"\n{lines}" if lines else "") +
+                     "\nBleibt diese Nachricht aus: GitHub → Actions prüfen (nach ~60 Tagen ohne Repo-Aktivität pausiert GitHub geplante Läufe).", dry)
             state["hb"] = time.time()
         except Exception as e:
             print(f"Heartbeat fehlgeschlagen: {scrub(e)}")
+
+
+# ---------------- Trade-Verfolgung ----------------
+def add_trade(state, s):
+    state.setdefault("_trades", []).append({
+        "id": s["id"], "symbol": s["symbol"], "side": s["side"], "setup": s["setup"],
+        "entry": s["entry"], "stop": s["stop"], "tp1": s["tp1"],
+        "t0": s["candle_ts"], "opened": time.time()})
+
+
+def _stats(state):
+    return state.setdefault("_stats", {"tp1": 0, "stop": 0, "expired": 0, "r": 0.0, "by": {}})
+
+
+def _book(state, tr, outcome, r):
+    st = _stats(state)
+    st[outcome] += 1
+    st["r"] = round(st["r"] + r, 2)
+    b = st.setdefault("by", {}).setdefault(tr["setup"], {"tp1": 0, "stop": 0})
+    if outcome in b:
+        b[outcome] += 1
+
+
+def check_trade(tr, df):
+    """Prüft Kerzen NACH der Signalkerze. -> ('tp1'|'stop'|None, Hinweis)"""
+    t0 = pd.Timestamp(tr["t0"])
+    for c in df[df.time > t0].itertuples():
+        if tr["side"] == "long":
+            hit_stop, hit_tp = c.low <= tr["stop"], c.high >= tr["tp1"]
+        else:
+            hit_stop, hit_tp = c.high >= tr["stop"], c.low <= tr["tp1"]
+        if hit_stop and hit_tp:
+            return "stop", "Stop und Ziel in derselben Kerze, vorsichtig als Stop gewertet"
+        if hit_stop:
+            return "stop", ""
+        if hit_tp:
+            return "tp1", ""
+    return None, ""
+
+
+def stats_line(state):
+    st = state.get("_stats")
+    if not st or not (st["tp1"] + st["stop"] + st["expired"]):
+        return "Bilanz: noch keine abgeschlossene Meldung."
+    n = st["tp1"] + st["stop"]
+    quote = f" ({st['tp1'] / n:.0%} Treffer)" if n else ""
+    return (f"Bilanz: {st['tp1']}x TP1, {st['stop']}x Stop, {st['expired']}x ohne Ergebnis{quote}, "
+            f"Summe {st['r']:+.1f}R")
+
+
+def setup_lines(state):
+    out = []
+    for name, b in (state.get("_stats", {}).get("by", {})).items():
+        n = b["tp1"] + b["stop"]
+        if n:
+            out.append(f"  {name}: {b['tp1']} von {n} bis TP1")
+    return "\n".join(out)
+
+
+def update_trades(state, frames, now, dry):
+    keep = []
+    for tr in state.get("_trades", []):
+        df = frames.get(tr["symbol"])
+        res, note = check_trade(tr, df) if df is not None else (None, "")
+        age_h = (time.time() - tr["opened"]) / 3600
+        head = f"{tr['symbol']} {tr['side'].upper()} ({tr['setup']})"
+        if res == "tp1":
+            _book(state, tr, "tp1", 2.0)
+            msg = f"✅ {head}: TP1 erreicht (+2R)\nEinstieg {tr['entry']} → Ziel {tr['tp1']}"
+        elif res == "stop":
+            _book(state, tr, "stop", -1.0)
+            msg = f"❌ {head}: Stop getroffen (-1R)\nEinstieg {tr['entry']} → Stop {tr['stop']}"
+            if note:
+                msg += f"\n({note})"
+        elif age_h > TRADE_MAX_H:
+            _book(state, tr, "expired", 0.0)
+            msg = f"⏱ {head}: nach {int(age_h)} h weder TP1 noch Stop, ohne Ergebnis geschlossen"
+        else:
+            keep.append(tr)
+            continue
+        try:
+            telegram(msg + "\n" + stats_line(state), dry)
+        except Exception as e:
+            print(f"Ergebnis-Meldung fehlgeschlagen: {scrub(e)}")
+    state["_trades"] = keep
 
 
 # ---------------- Hauptprogramm ----------------
@@ -432,10 +525,12 @@ def main():
     if forex_open and env("TWELVEDATA_KEY"):
         jobs += [(n, lambda s=s: fetch_twelve(s)) for n, s in FOREX.items()]
 
-    candidates, errors = [], 0
+    candidates, errors, frames = [], 0, {}
     for name, fetch in jobs:
         try:
-            for s in find_setups(name, check_fresh(name, fetch(), now)):
+            df = check_fresh(name, fetch(), now)
+            frames[name] = df
+            for s in find_setups(name, df):
                 if time.time() - state.get(s["id"], 0) > COOLDOWN_H * 3600:
                     candidates.append(s)
         except Exception as e:
@@ -443,6 +538,11 @@ def main():
             print(f"[{name}] Fehler: {scrub(e)}")
             alert_error(state, name, f"{name}: {scrub(e)[:150]}", a.dry)
     print(f"{now:%H:%M} UTC: {len(jobs)} Märkte geprüft, {errors} Fehler, {len(candidates)} neue Kandidaten")
+
+    try:
+        update_trades(state, frames, now, a.dry)
+    except Exception as e:
+        print(f"Trade-Verfolgung fehlgeschlagen: {scrub(e)}")
 
     b = in_blackout(now)
     if b:
@@ -459,6 +559,7 @@ def main():
             results = []
         for s, q, text in apply_limits(results, state):
             telegram(format_msg(s, q, text), a.dry)
+            add_trade(state, s)
 
     heartbeat(state, now, len(jobs), errors, a.dry)
     save_state(state)
