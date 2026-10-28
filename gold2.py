@@ -177,35 +177,130 @@ def run(raw, dry):
     h = prepare(raw)
     base = base_signals(h); deep = base_signals(h, deep=True)
     flt = lambda sig, *fs: cooldown([s for s in sig if all(f(h, *s) for f in fs)])
-    variants = [
-        ("V0 Basis", flt(base), "fixed"),
-        ("V1 nur 07-17 UTC", flt(base, f_session), "fixed"),
-        ("V2 mit Bestätigungskerze", flt(base), "confirm"),
-        ("V3 Abstand zum Level >= 1R", flt(base, f_level), "fixed"),
-        ("V4 tiefer Rücksetzer (EMA50)", flt(deep), "fixed"),
-        ("V5 auch 4h-Trend passend", flt(base, f_4h), "fixed"),
-        ("V6 normale Volatilität", flt(base, f_vol), "fixed"),
-        ("V7 Teilausstieg 1R + Trailing", flt(base), "trail"),
-        ("V8 Kombi V1+V3+V5", flt(base, f_session, f_level, f_4h), "fixed"),
-        ("V9 Kombi V8 + Trailing", flt(base, f_session, f_level, f_4h), "trail"),
+    spec = [
+        ("V0 Basis", base, "fixed", []),
+        ("V1 nur 07-17 UTC", base, "fixed", [f_session]),
+        ("V2 mit Bestätigungskerze", base, "confirm", []),
+        ("V3 Abstand zum Level >= 1R", base, "fixed", [f_level]),
+        ("V4 tiefer Rücksetzer (EMA50)", deep, "fixed", []),
+        ("V5 auch 4h-Trend passend", base, "fixed", [f_4h]),
+        ("V6 normale Volatilität", base, "fixed", [f_vol]),
+        ("V7 Teilausstieg 1R + Trailing", base, "trail", []),
+        ("V8 Kombi V1+V3+V5", base, "fixed", [f_session, f_level, f_4h]),
+        ("V9 Kombi V8 + Trailing", base, "trail", [f_session, f_level, f_4h]),
     ]
+    variants = [(n_, flt(s_, *fs), m_, fs) for n_, s_, m_, fs in spec]
     out, good = [], []
-    for name, sig, mode in variants:
+    for name, sig, mode, _f in variants:
         if mode == "trail":
             l, g = judge(name, trail_exit(h, sig), ["T"])
         else:
             l, g = judge(name, fixed_exit(h, sig, confirm=(mode == "confirm")), list(TPS))
         out += l; good += g
+    bench = benchmark(h, variants)
     yrs = (raw.time.max() - raw.time.min()).days / 365.25
     text = (f"Gold-Labor 2 (XAU/USD 1h, {len(raw)} Kerzen, {raw.time.min():%Y-%m-%d} bis {raw.time.max():%Y-%m-%d}, ca. {yrs:.1f} Jahre, Kosten {COST} $)\n"
             f"Grundmuster: Rücksetzer im Tagestrend, Einstieg zum Schlusskurs, Stop hinter dem 6-Kerzen-Extrem.\n\n" + "\n".join(out) + "\n\n"
             + ("KANDIDATEN (n>=100, t>=3, >=70% von mind. 6 Quartalen im Plus, Kosten x2 positiv):\n" + "\n".join(good) if good
                else "Kein Kandidat erfüllt alle Bedingungen (n>=100, t>=3, >=70% von mind. 6 Quartalen im Plus, Kosten x2 positiv).")
+            + "\n\n" + bench
             + "\n\n10 Varianten vorab festgelegt, keine nachträgliche Anpassung. Sommer-/Winterzeit verschiebt Sessions um eine Stunde.")
     print(text)
     sm = os.environ.get("GITHUB_STEP_SUMMARY")
     if sm: open(sm, "a").write("```\n" + text + "\n```\n")
     for i in range(0, len(text), 3800): S.telegram(text[i:i + 3800], dry)
+
+
+# ---------------- Zufallsvergleich ----------------
+SIMS = 100                    # Wiederholungen je Variante
+
+
+def _fixed_fast(A, sig, confirm):
+    hi, lo, op, cl = A["hi"], A["lo"], A["op"], A["cl"]; n = len(cl)
+    res = {k: [] for k in TPS}
+    for i, side, stop in sig:
+        sg = 1 if side == "long" else -1
+        if confirm:
+            trig = hi[i] if sg == 1 else lo[i]
+            j = next((j for j in range(i + 1, min(i + 3, n)) if (hi[j] >= trig if sg == 1 else lo[j] <= trig)), None)
+            if j is None: continue
+            entry = max(trig, op[j]) if sg == 1 else min(trig, op[j]); start = j; first = True
+        else:
+            entry, start, first = cl[i], i + 1, False
+        risk = abs(entry - stop)
+        if risk <= 0 or start + 4 >= n or (sg == 1 and entry <= stop) or (sg == -1 and entry >= stop): continue
+        c = COST / risk
+        for k in TPS:
+            tp = entry + sg * k * risk; g = 0.0
+            for j in range(start, min(start + MAX_HOLD, n)):
+                h_, l_ = (entry, lo[j]) if (first and j == start and sg == 1) else (hi[j], entry) if (first and j == start) else (hi[j], lo[j])
+                if (l_ <= stop) if sg == 1 else (h_ >= stop): g = -1.0; break
+                if (h_ >= tp) if sg == 1 else (l_ <= tp): g = k; break
+            res[k].append(g - c)
+    return {k: float(np.mean(v)) if v else np.nan for k, v in res.items()}
+
+
+def _trail_fast(A, sig, trail_atr=2.0, hold=72):
+    hi, lo, cl, atr = A["hi"], A["lo"], A["cl"], A["atr"]; n = len(cl); out = []
+    for i, side, stop in sig:
+        sg = 1 if side == "long" else -1
+        entry, a = cl[i], atr[i]; risk = abs(entry - stop)
+        if risk <= 0 or i + 4 >= n: continue
+        part, st, best, res = False, stop, entry, None
+        for j in range(i + 1, min(i + 1 + hold, n)):
+            if (lo[j] <= st) if sg == 1 else (hi[j] >= st):
+                rest = (st - entry) / risk * sg; res = (0.5 + 0.5 * rest) if part else -1.0; break
+            if not part and ((hi[j] >= entry + risk) if sg == 1 else (lo[j] <= entry - risk)):
+                part, st = True, entry
+            if part:
+                best = max(best, cl[j]) if sg == 1 else min(best, cl[j])
+                ns = best - sg * trail_atr * a
+                st = max(st, ns) if sg == 1 else min(st, ns)
+        if res is None:
+            j = min(i + hold, n - 1); rest = (cl[j] - entry) / risk * sg; res = (0.5 + 0.5 * rest) if part else rest
+        out.append(res - COST / risk)
+    return {"T": float(np.mean(out)) if out else np.nan}
+
+
+def random_twins(h, A, sig, filters, rng):
+    """Zu jedem echten Signal ein zufälliger Zeitpunkt mit gleicher Richtung, gleichem Tagestrend, gleichen Filtern und gleicher Stop-Weite (in ATR)."""
+    n = len(h)
+    pools = {s: np.where(A["td"] == (1 if s == "long" else -1))[0] for s in ("long", "short")}
+    pools = {s: p[(p > 210) & (p < n - 40)] for s, p in pools.items()}
+    out = []
+    for i, side, stop in sig:
+        sg = 1 if side == "long" else -1
+        ratio = abs(A["cl"][i] - stop) / A["atr"][i]
+        for _ in range(30):
+            j = int(rng.choice(pools[side]))
+            st = A["cl"][j] - sg * ratio * A["atr"][j]
+            if all(f(h, j, side, st) for f in filters):
+                out.append((j, side, st)); break
+    return out
+
+
+def benchmark(h, variants):
+    A = {"hi": h.high.values, "lo": h.low.values, "op": h.open.values, "cl": h.close.values, "atr": h.atr.values, "td": h.trend_d.values}
+    rng = np.random.default_rng(42)
+    lines = [f"ZUFALLSVERGLEICH ({SIMS} Durchläufe je Variante): gleiche Richtung, gleicher Tagestrend, gleiche Filter und Stop-Weite, "
+             "aber zufälliger Einstiegszeitpunkt. p = Anteil der Zufallsläufe, die mindestens so gut waren wie der echte Einstieg."]
+    for name, sig, mode, filters in variants:
+        real = _trail_fast(A, sig) if mode == "trail" else _fixed_fast(A, sig, mode == "confirm")
+        sims = [(_trail_fast(A, tw) if mode == "trail" else _fixed_fast(A, tw, mode == "confirm"))
+                for tw in (random_twins(h, A, sig, filters, rng) for _ in range(SIMS))]
+        parts = []
+        for k in real:
+            s = np.array([x[k] for x in sims if not np.isnan(x[k])])
+            if not len(s) or np.isnan(real[k]): continue
+            p = float((s >= real[k]).mean())
+            tag = " <- klar besser als Zufall" if p < 0.01 else " <- Hinweis" if p < 0.05 else ""
+            lab = "Trailing" if k == "T" else f"{k}R"
+            parts.append(f"{lab}: echt {real[k]:+.2f} | Zufall {s.mean():+.2f} (95%: {np.percentile(s, 95):+.2f}) p={p:.2f}{tag}")
+        lines.append(f"{name}: " + " ; ".join(parts))
+        print(lines[-1], flush=True)
+    lines.append("Lesart: Liegt der echte Wert im Zufallsbereich (p > 0,05), bringt der Rücksetzer-Einstieg nichts über den Trend hinaus. "
+                 "Bei 25 Vergleichen ist ein einzelnes p < 0,05 auch durch Zufall möglich, belastbar wäre erst p < 0,01 bei mehreren Varianten.")
+    return "\n".join(lines)
 
 
 def main():
