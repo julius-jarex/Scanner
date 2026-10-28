@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Daytrading-Scanner (Forex & Krypto): Kurse holen -> Setups per Regel finden -> Telegram.
+"""Daytrading-Scanner (Forex & Krypto): Kurse holen -> Setups per Regel finden -> bewerten -> Telegram.
 Standard: komplett kostenlos (nur Regeln). Optional: Claude als Zusatzfilter (USE_CLAUDE=1 + API-Key).
 Nur Hinweise, keine Orders. Aufruf: python scanner.py [--dry] [--test]"""
-import os, sys, json, time, math, argparse
+import os, sys, io, json, time, math, argparse
 from datetime import datetime, timezone, timedelta
 import requests
 import pandas as pd
@@ -10,9 +10,11 @@ import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 
 # ---------------- Einstellungen (hier anpassen) ----------------
-CRYPTO = {"BTCUSD": "XBTUSD", "ETHUSD": "ETHUSD", "SOLUSD": "SOLUSD"}          # Kraken-Paare (kostenlos, ohne Key)
-FOREX = {"EURUSD": "EUR/USD", "GBPUSD": "GBP/USD", "USDJPY": "USD/JPY", "XAUUSD": "XAU/USD"}  # Twelve Data (Gratis-Key)
+CRYPTO = {"BTCUSD": "XBTUSD"}          # Kraken-Paare (kostenlos, ohne Key)
+FOREX = {"EURUSD": "EUR/USD", "GBPUSD": "GBP/USD", "USDJPY": "USD/JPY", "XAUUSD": "XAU/USD",
+         "AUDUSD": "AUD/USD", "USDCAD": "USD/CAD"}  # Twelve Data (Gratis-Key)
 FOREX_HOURS_UTC = (6, 20)      # Forex nur zwischen 06:00 und 20:00 UTC, Mo-Fr
+SESSION_UTC = (7, 17)          # aktive Forex-Session (London + New York), ausserhalb davon kein Bonus
 MODEL = "claude-sonnet-5-5"    # nur relevant bei USE_CLAUDE=1
 STATE_FILE = "state.json"
 COOLDOWN_H = 4                 # gleiches Setup nicht öfter als alle 4 Stunden melden
@@ -25,8 +27,20 @@ CORR_HOURS = 8                 # gleiche Marktrichtung (z. B. USD-short) nicht z
 ERR_COOLDOWN_H = 6             # gleiche Fehlermeldung höchstens alle 6 Stunden
 HEARTBEAT_HOUR_UTC = 7         # tägliches Lebenszeichen ab 07:00 UTC
 INFO_COOLDOWN_H = 2            # Folgesignal-Infos zu derselben offenen Meldung höchstens alle 2 Stunden
-TRADE_MAX_H = 30               # Meldung ohne TP1/Stop nach so vielen Stunden als "ohne Ergebnis" schließen
+TRADE_MAX_H = 30               # Meldung ohne Ergebnis nach so vielen Stunden schliessen
+DAILY_LOSS_R = 3.0             # nach diesem Tagesverlust (in R) keine neuen Meldungen mehr (Secret DAILY_LOSS_R überschreibt)
+TP1_R, TP2_R = 2.0, 3.0        # Ziele in Vielfachen des Risikos
+TP1_SHARE = 0.5                # Anteil, der bei TP1 geschlossen wird (nur TRADE_MODE=partial)
+# runde Marken je Symbol (Abstand zwischen zwei "runden" Preisen)
+ROUND_STEP = {"EURUSD": 0.005, "GBPUSD": 0.005, "USDJPY": 0.5, "XAUUSD": 10.0,
+              "BTCUSD": 1000.0, "ETHUSD": 50.0, "SOLUSD": 5.0, "AUDUSD": 0.005, "USDCAD": 0.005,
+              "XRPUSD": 0.1, "ADAUSD": 0.05, "LINKUSD": 1.0}
+# angenommene Kosten (Spread/Gebühren) je Trade: Forex/Gold absolut in Preis, Krypto in % vom Preis (Secret COST_CRYPTO_PCT)
+COST_ABS = {"EURUSD": 0.00010, "GBPUSD": 0.00012, "USDJPY": 0.010, "XAUUSD": 0.30, "AUDUSD": 0.00012, "USDCAD": 0.00015}
+COST_CRYPTO_PCT = 0.001
 # ---------------------------------------------------------------
+
+NAMES = {"tp1": "TP1", "tp2": "TP2", "be": "Break-even nach TP1", "stop": "Stop", "expired": "ohne Ergebnis"}
 
 
 def load_env():
@@ -55,6 +69,10 @@ def env(name, default=None, required=False):
     return v
 
 
+def trade_mode():
+    return "partial" if (env("TRADE_MODE", "simple") or "").lower() == "partial" else "simple"
+
+
 # ---------------- Daten ----------------
 def fetch_kraken(pair):
     r = requests.get("https://api.kraken.com/0/public/OHLC", params={"pair": pair, "interval": 15}, timeout=20)
@@ -63,16 +81,18 @@ def fetch_kraken(pair):
     if j.get("error"):
         raise RuntimeError(j["error"])
     rows = next(v for k, v in j["result"].items() if k != "last")
-    df = pd.DataFrame(rows).iloc[:, :5]
+    raw = pd.DataFrame(rows)
+    df = raw.iloc[:, :5].copy()
     df.columns = ["t", "open", "high", "low", "close"]
     df["time"] = pd.to_datetime(df["t"].astype(int), unit="s", utc=True)
     df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
-    return df[["time", "open", "high", "low", "close"]].iloc[:-1].reset_index(drop=True)  # letzte Kerze läuft noch
+    df["volume"] = raw.iloc[:, 6].astype(float) if raw.shape[1] > 6 else float("nan")
+    return df[["time", "open", "high", "low", "close", "volume"]].iloc[:-1].reset_index(drop=True)  # letzte Kerze läuft noch
 
 
-def fetch_twelve(symbol):
+def fetch_twelve(symbol, outputsize=800):
     r = requests.get("https://api.twelvedata.com/time_series", params={
-        "symbol": symbol, "interval": "15min", "outputsize": 500, "timezone": "UTC",
+        "symbol": symbol, "interval": "15min", "outputsize": outputsize, "timezone": "UTC",
         "apikey": env("TWELVEDATA_KEY", required=True)}, timeout=20)
     j = r.json()
     if j.get("status") == "error":
@@ -80,8 +100,17 @@ def fetch_twelve(symbol):
     df = pd.DataFrame(j["values"])
     df["time"] = pd.to_datetime(df["datetime"], utc=True)
     df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
-    df = df.sort_values("time")[["time", "open", "high", "low", "close"]]
+    df["volume"] = float("nan")
+    df = df.sort_values("time")[["time", "open", "high", "low", "close", "volume"]]
     return df.iloc[:-1].reset_index(drop=True)
+
+
+def check_fresh(name, df, now):
+    """Veraltete Kursdaten (API-Fehler, Marktpause) -> Fehler statt falscher Signale."""
+    age = (now - df.time.iloc[-1].to_pydatetime()).total_seconds() / 60
+    if age > MAX_DATA_AGE_MIN:
+        raise RuntimeError(f"Kursdaten veraltet (letzte Kerze vor {int(age)} Min.)")
+    return df
 
 
 # ---------------- Setups ----------------
@@ -104,12 +133,49 @@ def htf_trend(df):
     return "flat"
 
 
+def day_levels(df):
+    """Vortageshoch/-tief (UTC-Tag). (None, None), wenn zu wenig Daten vorliegen."""
+    d = df.set_index("time").resample("1D").agg({"high": "max", "low": "min"}).dropna()
+    if len(d) < 2:
+        return None, None
+    return float(d.high.iloc[-2]), float(d.low.iloc[-2])
+
+
+def round_levels(sym, price):
+    step = ROUND_STEP.get(sym)
+    if not step:
+        return None, None
+    down = math.floor(price / step + 1e-9) * step
+    up = down + step
+    if abs(down - price) < step * 1e-6:
+        down -= step
+    return round(down, 6), round(up, 6)
+
+
+def next_level(side, entry, levels):
+    """Nächstes Level in Handelsrichtung hinter dem Einstieg."""
+    levels = [(n, p) for n, p in levels if p is not None]
+    if side == "long":
+        c = [(n, p) for n, p in levels if p > entry]
+        return min(c, key=lambda x: x[1]) if c else (None, None)
+    c = [(n, p) for n, p in levels if p < entry]
+    return max(c, key=lambda x: x[1]) if c else (None, None)
+
+
+def cost_r(sym, entry, risk):
+    if not risk:
+        return 0.0
+    c = COST_ABS[sym] if sym in COST_ABS else entry * float(env("COST_CRYPTO_PCT", COST_CRYPTO_PCT))
+    return c / risk
+
+
 def size(sym, entry, stop):
     risk = float(env("ACCOUNT_SIZE", 1000)) * float(env("RISK_PERCENT", 1)) / 100
     dist = abs(entry - stop)
     if sym in FOREX:
         if sym == "XAUUSD": per_lot = dist * 100                 # Verlust je 1 Lot bei Stop
         elif sym == "USDJPY": per_lot = (dist / 0.01) * (1000 / entry)
+        elif sym == "USDCAD": per_lot = (dist / 0.0001) * (10 / entry)
         else: per_lot = (dist / 0.0001) * 10
         lots = math.floor(risk / per_lot * 100) / 100          # immer abrunden
         if lots < 0.01:
@@ -129,6 +195,15 @@ def find_setups(sym, df):
     atr = last.atr
     hi20, lo20 = prev.high.max(), prev.low.min()
     body = abs(last.close - last.open)
+    pdh, pdl = day_levels(df)
+    rdown, rup = round_levels(sym, float(last.close))
+    atr_med = float(df.atr.iloc[-200:].median())
+    atr_ratio = float(atr / atr_med) if atr_med else 1.0
+    vol_ratio = None
+    if "volume" in df and pd.notna(last.get("volume")):
+        vmed = float(df.volume.iloc[-51:-1].median())
+        if vmed > 0:
+            vol_ratio = float(last.volume / vmed)
     out = []
 
     def add(name, side, stop):
@@ -137,15 +212,21 @@ def find_setups(sym, df):
         if not (0.5 * atr <= risk <= 3 * atr):
             return
         sgn = 1 if side == "long" else -1
+        levels = [("20-Kerzen-Hoch", float(hi20)), ("20-Kerzen-Tief", float(lo20)), ("Rundzahl", rup),
+                  ("Rundzahl", rdown), ("Vortageshoch", pdh), ("Vortagestief", pdl)]
+        lv_name, lv_price = next_level(side, entry, levels)
         out.append({
             "id": f"{sym}|{name}|{side}", "symbol": sym, "setup": name, "side": side,
             "candle_time": last.time.strftime("%Y-%m-%d %H:%M UTC"), "candle_ts": last.time.isoformat(),
             "entry": round(entry, 5), "stop": round(float(stop), 5),
-            "tp1": round(entry + sgn * 2 * risk, 5), "tp2": round(entry + sgn * 3 * risk, 5),
+            "tp1": round(entry + sgn * TP1_R * risk, 5), "tp2": round(entry + sgn * TP2_R * risk, 5),
             "htf_trend_1h": trend, "atr15": round(float(atr), 5),
             "ema20": round(float(last.ema20), 5), "ema50": round(float(last.ema50), 5),
             "high_20_candles": round(float(hi20), 5), "low_20_candles": round(float(lo20), 5),
             "body_atr": round(float(body / atr), 2), "risk_dist": float(risk),
+            "next_level_name": lv_name, "next_level": None if lv_price is None else round(lv_price, 5),
+            "room_r": None if lv_price is None else round(abs(lv_price - entry) / risk, 2),
+            "atr_ratio": round(atr_ratio, 2), "vol_ratio": None if vol_ratio is None else round(vol_ratio, 2),
             "size": size(sym, entry, stop)})
 
     low6, high6 = df.low.iloc[-6:].min(), df.high.iloc[-6:].max()
@@ -167,12 +248,43 @@ def find_setups(sym, df):
     return out
 
 
+# ---------------- Verlauf eines Trades (auch vom Backtest genutzt) ----------------
+def simulate_path(side, entry, stop, tp1, tp2, hl, mode="simple"):
+    """hl: Liste (high, low) der Kerzen NACH dem Signal. Rückgabe (status, R).
+    status: open | tp1_open | stop | tp1 | tp2 | be.
+    simple : TP1 (+2R) oder Stop (-1R), was zuerst kommt.
+    partial: bei TP1 Teilgewinn, Stop auf Einstieg, Rest bis TP2 oder Break-even.
+    Berühren Stop und Ziel dieselbe Kerze, zählt vorsichtig der Stop."""
+    long_ = side == "long"
+    r_be = TP1_SHARE * TP1_R
+    r_tp2 = TP1_SHARE * TP1_R + (1 - TP1_SHARE) * TP2_R
+    phase = 1
+    for hi, lo in hl:
+        if phase == 1:
+            hit_stop = lo <= stop if long_ else hi >= stop
+            hit_tp1 = hi >= tp1 if long_ else lo <= tp1
+            if hit_stop:
+                return "stop", -1.0
+            if hit_tp1:
+                if mode == "simple":
+                    return "tp1", TP1_R
+                phase = 2
+        else:
+            hit_be = lo <= entry if long_ else hi >= entry
+            hit_tp2 = hi >= tp2 if long_ else lo <= tp2
+            if hit_be:
+                return "be", r_be
+            if hit_tp2:
+                return "tp2", r_tp2
+    return ("tp1_open", r_be) if phase == 2 else ("open", 0.0)
+
+
 # ---------------- Gratis-News-Check ----------------
 CAL_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"   # inoffizieller, kostenloser Wochenkalender
 RSS_FEEDS = ["https://www.coindesk.com/arc/outboundfeeds/rss/", "https://cointelegraph.com/rss"]
 RISK_WORDS = ["hack", "exploit", "stolen", "sec ", "lawsuit", "ban ", "delist", "halt", "outage",
               "insolven", "bankrupt", "liquidation", "crackdown", "sanction"]
-CCY = {"EURUSD": {"EUR", "USD"}, "GBPUSD": {"GBP", "USD"}, "USDJPY": {"USD", "JPY"}, "XAUUSD": {"USD"}}
+CCY = {"EURUSD": {"EUR", "USD"}, "GBPUSD": {"GBP", "USD"}, "USDJPY": {"USD", "JPY"}, "XAUUSD": {"USD"}, "AUDUSD": {"AUD", "USD"}, "USDCAD": {"USD", "CAD"}}
 LOOKAHEAD_MIN = 120            # Termine in den nächsten 2 Stunden werden als Warnung angezeigt
 HEADLINE_HOURS = 3             # Krypto-Schlagzeilen der letzten 3 Stunden
 
@@ -187,7 +299,8 @@ def fetch_news(now):
             if e.get("impact") != "High":
                 continue
             t = datetime.fromisoformat(e["date"]).astimezone(timezone.utc)
-            news["events"].append({"time": t, "ccy": e.get("country", ""), "title": e.get("title", "")})
+            news["events"].append({"time": t, "ccy": e.get("country", ""), "title": e.get("title", ""),
+                                   "forecast": e.get("forecast", ""), "previous": e.get("previous", "")})
     except Exception as ex:
         print(f"Kalender nicht verfügbar: {scrub(ex)}"); news["ok"] = False
     for url in RSS_FEEDS:
@@ -218,6 +331,8 @@ def news_check(sym, news, now):
             continue
         mins = (e["time"] - now).total_seconds() / 60
         label = f"{e['ccy']} {e['title']} um {e['time']:%H:%M} UTC"
+        if e.get("forecast") or e.get("previous"):
+            label += f" (Prognose {e.get('forecast') or '-'}, zuvor {e.get('previous') or '-'})"
         if -BLACKOUT_MIN <= mins <= BLACKOUT_MIN:
             block = True; notes.append("Termin jetzt: " + label)
         elif 0 < mins <= LOOKAHEAD_MIN:
@@ -232,7 +347,7 @@ def news_check(sym, news, now):
 
 # ---------------- Gratis-Bewertung (ohne KI) ----------------
 def score_free(s, penalty=0):
-    """Punktesystem 0-6 minus News-Abzug. A >= 5, B = 4. Nachvollziehbar, keine Prognose."""
+    """Punktesystem 0-7 minus News-Abzug. A >= 5, B = 4. Nachvollziehbar, keine Prognose."""
     pts, why, risks = 0, [], []
     long_ = s["side"] == "long"
     aligned = (s["htf_trend_1h"] == "up") == long_ and s["htf_trend_1h"] != "flat"
@@ -243,19 +358,29 @@ def score_free(s, penalty=0):
     else:
         risks.append("gegen den 1h-Trend")
 
-    opp = s["high_20_candles"] if long_ else s["low_20_candles"]
-    room = (opp - s["entry"]) if long_ else (s["entry"] - opp)
-    if room >= 2 * s["risk_dist"] or room <= 0:
-        pts += 2; why.append("TP1 hat Platz bis zum nächsten Level" if room > 0 else "Preis über/unter dem 20-Kerzen-Level, freier Raum")
-    elif room >= 1 * s["risk_dist"]:
-        pts += 1; risks.append("nächstes Level liegt vor TP1")
+    room_r, name = s.get("room_r"), s.get("next_level_name") or "Level"
+    if room_r is None or room_r >= 2:
+        pts += 2; why.append("Platz bis zum nächsten Level" + ("" if room_r is None else f" ({name}, {room_r:.1f}R)"))
+    elif room_r >= 1:
+        pts += 1; risks.append(f"{name} bei {room_r:.1f}R, vor TP1")
     else:
-        risks.append("Level direkt vor dem Einstieg")
+        risks.append(f"{name} direkt voraus ({room_r:.1f}R)")
 
     if s["body_atr"] >= 0.6:
         pts += 1; why.append("kräftige Signalkerze")
     if s["setup"] != "Liquidity-Sweep" and aligned:
         pts += 1; why.append(f"{s['setup']} mit Trend")
+
+    hour = pd.Timestamp(s["candle_ts"]).hour if s.get("candle_ts") else 12
+    active = (s["symbol"] not in FOREX) or (SESSION_UTC[0] <= hour < SESSION_UTC[1])
+    calm = s.get("atr_ratio", 1.0) < 0.8
+    if active and not calm:
+        pts += 1; why.append("aktive Marktphase")
+    else:
+        risks.append("ruhige Session" if not active else "flaue Volatilität")
+    if s["setup"] == "Range-Breakout" and s.get("vol_ratio") is not None and s["vol_ratio"] < 0.8:
+        pts -= 1; risks.append("Ausbruch ohne Volumen")
+
     pts -= penalty
     q = "A" if pts >= 5 else "B" if pts == 4 else "C"
     return q, why, risks
@@ -278,7 +403,7 @@ def in_blackout(now):
 # ---------------- Claude (optional) ----------------
 SYSTEM = """Du bist ein nüchterner Daytrading-Analyst für Forex und Krypto. Du bekommst Setup-Kandidaten als JSON (15m-Daten, 1h-Trend).
 Spiele für jeden Kandidaten kurz Bull-, Base-, Bear- und Fakeout-Fall durch. Prüfe: Liegt TP1 realistisch vor dem nächsten gegnerischen Level
-(high_20_candles / low_20_candles)? Ist der Stop strukturell sinnvoll? Passt der 1h-Trend? Suche per Websuche High-Impact-Termine in den nächsten
+(next_level, high_20_candles / low_20_candles)? Ist der Stop strukturell sinnvoll? Passt der 1h-Trend? Suche per Websuche High-Impact-Termine in den nächsten
 60 Minuten und aktuelle Meldungen zum Symbol. HANDELN nur bei klarem Setup, TP1 mit CRV >= 1:2 und ohne akutes Event-Risiko. Im Zweifel ABWARTEN.
 Erfinde keine Daten. Antworte NUR mit JSON: {"results":[{"id":"<id>","verdict":"HANDELN|ABWARTEN|VERWERFEN","quality":"A|B|C","text":"max 3 kurze Sätze auf Deutsch"}]}"""
 
@@ -298,37 +423,226 @@ def ask_claude(setups, news=True):
     return json.loads(text[text.find("{"): text.rfind("}") + 1])["results"]
 
 
-# ---------------- Telegram / Status ----------------
-def telegram(text, dry=False):
-    if dry:
-        print("---- TELEGRAM (dry) ----\n" + text + "\n"); return
-    r = requests.post(f"https://api.telegram.org/bot{env('TELEGRAM_TOKEN', required=True)}/sendMessage",
-                      json={"chat_id": env("TELEGRAM_CHAT_ID", required=True), "text": text}, timeout=20)
+# ---------------- Telegram ----------------
+def chat_ids():
+    return [c.strip() for c in (env("TELEGRAM_CHAT_ID", "") or "").split(",") if c.strip()]
+
+
+def tg(method, payload=None, files=None):
+    token = env("TELEGRAM_TOKEN", required=True)
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    if files:
+        r = requests.post(url, data=payload, files=files, timeout=60)
+    else:
+        r = requests.post(url, json=payload, timeout=30)
     r.raise_for_status()
+    return r.json()
 
 
+def telegram(text, dry=False, chat=None, buttons=None):
+    """Sendet an alle Empfänger (TELEGRAM_CHAT_ID, mehrere mit Komma) oder an einen bestimmten Chat."""
+    if dry:
+        print("---- TELEGRAM (dry) ----\n" + text + ("\n[Buttons: " + ", ".join(b["text"] for b in buttons) + "]" if buttons else "") + "\n")
+        return
+    targets = [chat] if chat else chat_ids()
+    if not targets:
+        sys.exit("Fehlende Einstellung: TELEGRAM_CHAT_ID")
+    errors = []
+    for c in targets:
+        payload = {"chat_id": c, "text": text[:4000]}
+        if buttons:
+            payload["reply_markup"] = {"inline_keyboard": [buttons]}
+        try:
+            tg("sendMessage", payload)
+        except Exception as e:
+            errors.append(e)
+    if errors and len(errors) == len(targets):
+        raise errors[0]
+
+
+def telegram_file(kind, data, filename, caption, dry=False, chat=None):
+    """kind: 'sendPhoto' oder 'sendDocument'."""
+    if dry:
+        print(f"---- TELEGRAM {kind} (dry): {filename}, {len(data)} Bytes ----\n"); return
+    field = "photo" if kind == "sendPhoto" else "document"
+    for c in ([chat] if chat else chat_ids()):
+        try:
+            tg(kind, {"chat_id": c, "caption": caption[:1000]}, files={field: (filename, data)})
+        except Exception as e:
+            print(f"{kind} fehlgeschlagen: {scrub(e)}")
+
+
+# ---------------- Chart ----------------
+def make_chart(s, df, n=96):
+    """Kerzenchart (PNG) mit EMA 20/50, Einstieg, Stop, TP1, TP2 und dem nächsten Level."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    d = add_ind(df.copy()).iloc[-n:].reset_index(drop=True)
+    bg, up, dn = "#0d1117", "#2ea043", "#f85149"
+    fig, ax = plt.subplots(figsize=(9, 5.2), dpi=110)
+    fig.patch.set_facecolor(bg); ax.set_facecolor(bg)
+    min_body = float(d.high.max() - d.low.min()) * 0.002
+    for i, r in d.iterrows():
+        col = up if r.close >= r.open else dn
+        ax.vlines(i, r.low, r.high, color=col, linewidth=0.8)
+        ax.bar(i, max(abs(r.close - r.open), min_body), bottom=min(r.open, r.close), width=0.6, color=col)
+    ax.plot(d.ema20, color="#58a6ff", linewidth=1, label="EMA 20")
+    ax.plot(d.ema50, color="#d29922", linewidth=1, label="EMA 50")
+    x1 = len(d) + 1
+    marks = [("Einstieg", s["entry"], "#c9d1d9", "-"), ("Stop", s["stop"], dn, "-"),
+             ("TP1", s["tp1"], up, "-"), ("TP2", s["tp2"], up, "--")]
+    if s.get("next_level"):
+        marks.append((s.get("next_level_name") or "Level", s["next_level"], "#a371f7", ":"))
+    for label, price, col, ls in marks:
+        ax.axhline(price, color=col, linestyle=ls, linewidth=1)
+        ax.text(x1, price, f" {label} {price}", color=col, va="center", fontsize=8)
+    lo = min([d.low.min(), s["stop"], s["tp1"]]); hi = max([d.high.max(), s["stop"], s["tp1"]])
+    pad = (hi - lo) * 0.06
+    ax.set_ylim(lo - pad, hi + pad)
+    ax.set_xlim(-1, len(d) + 14)
+    ticks = list(range(0, len(d), 12))
+    ax.set_xticks(ticks); ax.set_xticklabels([d.time.iloc[i].strftime("%H:%M") for i in ticks], color="#8b949e", fontsize=8)
+    ax.tick_params(axis="y", colors="#8b949e", labelsize=8)
+    for sp in ax.spines.values():
+        sp.set_color("#30363d")
+    ax.grid(color="#21262d", linewidth=0.5)
+    ax.set_title(f"{s['symbol']} 15m  {s['side'].upper()}  {s['setup']}   (UTC)", color="#c9d1d9", fontsize=11)
+    ax.legend(loc="upper left", facecolor=bg, edgecolor="#30363d", labelcolor="#c9d1d9", fontsize=8)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=bg, bbox_inches="tight")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def send_chart(s, df, no, dry):
+    if df is None:
+        return
+    try:
+        png = make_chart(s, df)
+    except Exception as e:
+        print(f"Chart fehlgeschlagen: {scrub(e)}"); return
+    telegram_file("sendPhoto", png, f"{s['symbol']}.png", f"#{no} {s['symbol']} {s['side'].upper()} – {s['setup']}", dry)
+
+
+# ---------------- Zustand ----------------
 def load_state():
-    try: return json.load(open(STATE_FILE))
-    except Exception: return {}
+    try: st = json.load(open(STATE_FILE))
+    except Exception: st = {}
+    return st
 
 
 def save_state(s):
     now = time.time()
-    json.dump({k: v for k, v in s.items() if not isinstance(v, (int, float)) or now - v < 86400},
+    json.dump({k: v for k, v in s.items()
+               if k.startswith("_") or not isinstance(v, (int, float)) or now - v < 86400},
               open(STATE_FILE, "w"))
 
 
-def format_msg(s, quality, text):
+def new_stats():
+    return {"c": {}, "r": 0.0, "rn": 0.0, "by": {}, "sym": {}}
+
+
+def stats_of(state, scope):
+    key = "_stats" if scope == "all" else "_stats_mine"
+    st = state.setdefault(key, new_stats())
+    if "c" not in st:      # alte Struktur aus früheren Versionen übernehmen
+        old = st
+        st = state[key] = new_stats()
+        st["c"] = {k: old.get(k, 0) for k in ("tp1", "stop", "expired") if old.get(k)}
+        st["r"] = st["rn"] = float(old.get("r", 0.0))
+    return st
+
+
+def stats_line(state, scope="all"):
+    label = "alle Meldungen" if scope == "all" else "deine Trades"
+    st = state.get("_stats" if scope == "all" else "_stats_mine")
+    if st and "c" not in st:
+        st = stats_of(state, scope)
+    if not st or not sum(st["c"].values()):
+        return f"Bilanz ({label}): noch nichts abgeschlossen."
+    parts = [f"{v}x {NAMES.get(k, k)}" for k, v in st["c"].items() if v]
+    return f"Bilanz ({label}): {', '.join(parts)}. Summe {st['r']:+.1f}R (nach Kosten {st['rn']:+.1f}R)"
+
+
+def stats_text(state):
+    out = [stats_line(state, "all")]
+    if state.get("_stats_mine"):
+        out.append(stats_line(state, "mine"))
+    st = state.get("_stats")
+    if st and st.get("by"):
+        out.append("Je Setup (nach Kosten):")
+        out += [f"  {n}: {b['n']} Trades, {b['r']:+.1f}R" for n, b in st["by"].items()]
+    if st and st.get("sym"):
+        out.append("Je Symbol (nach Kosten):")
+        out += [f"  {n}: {b['n']} Trades, {b['r']:+.1f}R" for n, b in st["sym"].items()]
+    out.append(f"Annahmen: Einstieg zum gemeldeten Preis, Kosten pauschal, Modus {trade_mode()}.")
+    return "\n".join(out)
+
+
+def day_check(state, now):
+    """(gesperrt, Tages-R). Zählt eigene Trades, wenn welche markiert wurden, sonst alle Meldungen."""
+    d = state.get("_day")
+    today = now.strftime("%Y-%m-%d")
+    if not d or d.get("date") != today:
+        return False, 0.0
+    v = d["mine"] if d.get("mine_n") else d["all"]
+    return v <= -float(env("DAILY_LOSS_R", DAILY_LOSS_R)), v
+
+
+def book(state, tr, outcome, r, now):
+    """Verbucht ein abgeschlossenes Ergebnis. Gibt R nach Kosten zurück."""
+    risk = abs(tr["entry"] - tr["stop"])
+    rn = r - cost_r(tr["symbol"], tr["entry"], risk)
+    for scope in ["all"] + (["mine"] if tr.get("taken") else []):
+        st = stats_of(state, scope)
+        st["c"][outcome] = st["c"].get(outcome, 0) + 1
+        st["r"] = round(st["r"] + r, 3); st["rn"] = round(st["rn"] + rn, 3)
+        for grp, key in (("by", tr["setup"]), ("sym", tr["symbol"])):
+            b = st.setdefault(grp, {}).setdefault(key, {"n": 0, "r": 0.0})
+            b["n"] += 1; b["r"] = round(b["r"] + rn, 3)
+    today = now.strftime("%Y-%m-%d")
+    d = state.get("_day")
+    if not d or d.get("date") != today:
+        d = state["_day"] = {"date": today, "all": 0.0, "mine": 0.0, "mine_n": 0}
+    d["all"] = round(d["all"] + rn, 3)
+    if tr.get("taken"):
+        d["mine"] = round(d["mine"] + rn, 3); d["mine_n"] += 1
+    j = state.setdefault("_journal", [])
+    j.append({"closed": now.strftime("%Y-%m-%d %H:%M"), "no": tr.get("no"), "symbol": tr["symbol"], "side": tr["side"],
+              "setup": tr["setup"], "quality": tr.get("q", ""), "signal_candle": tr["t0"], "entry": tr["entry"],
+              "stop": tr["stop"], "tp1": tr["tp1"], "outcome": outcome, "r": round(r, 2), "r_net": round(rn, 2),
+              "taken": {True: "ja", False: "nein"}.get(tr.get("taken"), "")})
+    del j[:-500]
+    return rn
+
+
+def journal_csv(state):
+    rows = state.get("_journal", [])
+    if not rows:
+        return None
+    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
+
+
+# ---------------- Meldungen ----------------
+def format_msg(s, quality, text, no=None):
     arrow = "🟢 LONG" if s["side"] == "long" else "🔴 SHORT"
     r = s["risk_dist"]
     if s["side"] == "long":
         expiry = f"Ungültig, wenn Preis über {round(s['entry'] + MAX_CHASE_R * r, 5)} steigt oder Stop {s['stop']} berührt."
     else:
         expiry = f"Ungültig, wenn Preis unter {round(s['entry'] - MAX_CHASE_R * r, 5)} fällt oder Stop {s['stop']} berührt."
-    return (f"{arrow} {s['symbol']} | {s['setup']} | Qualität {quality}\n"
+    level = ""
+    if s.get("next_level"):
+        level = f"Nächstes Level: {s.get('next_level_name')} bei {s['next_level']} ({s['room_r']:.1f}R)\n"
+    plan = ""
+    if trade_mode() == "partial":
+        plan = f"Plan: bei TP1 {TP1_SHARE:.0%} schließen, Stop auf Einstieg, Rest bis TP2.\n"
+    nr = f"#{no} " if no else ""
+    return (f"{arrow} {nr}{s['symbol']} | {s['setup']} | Qualität {quality}\n"
             f"Kerze: {s['candle_time']} | 1h-Trend: {s['htf_trend_1h']}\n\n"
-            f"Einstieg: {s['entry']}\nStop: {s['stop']}\nTP1 (2R): {s['tp1']}\nTP2 (3R): {s['tp2']}\n"
-            f"Größe: {s['size']}\n{expiry}\n\n{text}\n\n"
+            f"Einstieg: {s['entry']}\nStop: {s['stop']}\nTP1 ({TP1_R:g}R): {s['tp1']}\nTP2 ({TP2_R:g}R): {s['tp2']}\n"
+            f"{level}Größe: {s['size']}\n{plan}{expiry}\n\n{text}\n\n"
             f"Nur Hinweis, keine Anlageberatung. Preis, Größe und News vor der Order selbst prüfen.")
 
 
@@ -354,25 +668,19 @@ def evaluate(candidates, now, news=None):
             if risks: text += "\nRisiko: " + "; ".join(risks)
             text += "\nNews: " + ("; ".join(notes) if notes else "keine High-Impact-Termine/Risikomeldungen gefunden")
             out.append((s, q, text))
+        else:
+            print(f"{s['id']}: Qualität {q}, nicht gemeldet ({'; '.join(risks) or 'zu wenig Punkte'})")
     out.sort(key=lambda x: -order.get(x[1], 0))
     return out
 
 
 # ---------------- Sicherheitsregeln ----------------
-def check_fresh(name, df, now):
-    """Veraltete Kursdaten (API-Fehler, Marktpause) -> Fehler statt falscher Signale."""
-    age = (now - df.time.iloc[-1].to_pydatetime()).total_seconds() / 60
-    if age > MAX_DATA_AGE_MIN:
-        raise RuntimeError(f"Kursdaten veraltet (letzte Kerze vor {int(age)} Min.)")
-    return df
-
-
 def exposure(s):
     """Gleiche Marktrichtung zusammenfassen: EURUSD/GBPUSD/Gold long = USD short usw."""
     sym, side = s["symbol"], s["side"]
     if sym in CRYPTO:
         return f"KRYPTO-{side}"
-    usd_long = (side == "long") == (sym == "USDJPY")
+    usd_long = (side == "long") == sym.startswith("USD")
     return "USD-long" if usd_long else "USD-short"
 
 
@@ -380,8 +688,8 @@ def sent_recent(state, hours):
     now = time.time()
     out = []
     for k, v in state.items():
-        if k.startswith("sent|") and now - v < hours * 3600:
-            out.append(k.split("|", 2)[2])
+        if k.startswith("sent|") and isinstance(v, (int, float)) and now - v < hours * 3600:
+            out.append(k.split("|")[2])
     return out
 
 
@@ -398,7 +706,7 @@ def r_now(tr, df):
 def follow_msg(s, q, text, tr, frames):
     price, r = r_now(tr, frames.get(tr["symbol"]))
     same = s["symbol"] == tr["symbol"]
-    head = (f"🔁 Folgesignal zu deiner offenen Meldung ({tr['symbol']} {tr['side'].upper()}, {tr['setup']})\n"
+    head = (f"🔁 Folgesignal zu deiner offenen Meldung (#{tr.get('no', '?')} {tr['symbol']} {tr['side'].upper()}, {tr['setup']})\n"
             f"{s['symbol']} {s['setup']} {s['side']} (Qualität {q}) zeigt erneut in dieselbe Richtung.\n")
     if same:
         head += "Gleiches Paar: Das Setup bleibt aktuell intakt.\n"
@@ -413,15 +721,26 @@ def follow_msg(s, q, text, tr, frames):
             "\n\nKein neues Einstiegssignal, nur eine Info. Kein Ersatz für Chart und eigene Planung.")
 
 
-def apply_limits(results, state, frames=None):
-    """Tageslimit und Korrelationsfilter. Gibt (erlaubte Meldungen, Folgesignal-Infos) zurück."""
+def apply_limits(results, state, frames=None, now=None):
+    """Tagesverlust, Tageslimit und Korrelationsfilter. Gibt (erlaubte Meldungen, Infos) zurück."""
     frames = frames or {}
+    now = now or datetime.now(timezone.utc)
     allowed, infos = [], []
+    blocked, v = day_check(state, now)
+    if blocked:
+        key = f"dl|{now:%Y-%m-%d}"
+        if results and not state.get(key):
+            infos.append(f"⛔ Tagesverlustlimit erreicht ({v:+.1f}R, Grenze -{float(env('DAILY_LOSS_R', DAILY_LOSS_R)):g}R). "
+                         "Bis morgen 00:00 UTC keine neuen Meldungen.")
+            state[key] = time.time()
+        for s, q, text in results:
+            print(f"{s['id']} unterdrückt: Tagesverlustlimit erreicht ({v:+.1f}R)")
+        return [], infos
     for s, q, text in results:
         ex = exposure(s)
         if ex in sent_recent(state, CORR_HOURS):
             # gleichgerichtet zu kürzlich Gemeldetem: Info nur, wenn dazu eine Meldung noch offen ist
-            tr = next((t for t in state.get("_trades", []) if exposure(t) == ex), None)
+            tr = next((t for t in state.get("_trades", []) if exposure(t) == ex and t.get("taken") is not False), None)
             key = f"info|{tr['id']}|{s['id']}" if tr else None
             if tr and time.time() - state.get(key, 0) > INFO_COOLDOWN_H * 3600:
                 infos.append(follow_msg(s, q, text, tr, frames))
@@ -432,7 +751,9 @@ def apply_limits(results, state, frames=None):
             continue
         if len(sent_recent(state, 24)) >= MAX_SIGNALS_PER_DAY:
             print(f"{s['id']} unterdrückt: Tageslimit erreicht"); continue
-        state[f"sent|{time.time():.3f}|{ex}"] = time.time()
+        key = f"sent|{time.time():.3f}|{ex}"
+        state[key] = time.time()
+        s["sent_key"] = key
         allowed.append((s, q, text))
     return allowed, infos
 
@@ -452,99 +773,183 @@ def heartbeat(state, now, checked, errors, dry):
     if now.hour >= HEARTBEAT_HOUR_UTC and time.time() - state.get("hb", 0) > 20 * 3600:
         n = len(sent_recent(state, 24))
         try:
-            lines = setup_lines(state)
+            mine = f"\n{stats_line(state, 'mine')}" if state.get("_stats_mine") else ""
             telegram(f"💚 Scanner läuft. Letzte 24h: {n} Meldung(en). Aktuell {checked} Märkte geprüft, {errors} Fehler, "
-                     f"{len(state.get('_trades', []))} offene Meldung(en).\n{stats_line(state)}"
-                     + (f"\n{lines}" if lines else "") +
-                     "\nBleibt diese Nachricht aus: GitHub → Actions prüfen (nach ~60 Tagen ohne Repo-Aktivität pausiert GitHub geplante Läufe).", dry)
+                     f"{len(state.get('_trades', []))} offene Meldung(en).\n{stats_line(state)}{mine}\n"
+                     "Befehle: /status /bilanz /journal /hilfe\n"
+                     "Bleibt diese Nachricht aus: GitHub → Actions prüfen (nach ~60 Tagen ohne Repo-Aktivität pausiert GitHub geplante Läufe).", dry)
             state["hb"] = time.time()
         except Exception as e:
             print(f"Heartbeat fehlgeschlagen: {scrub(e)}")
 
 
 # ---------------- Trade-Verfolgung ----------------
-def add_trade(state, s):
-    state.setdefault("_trades", []).append({
-        "id": s["id"], "symbol": s["symbol"], "side": s["side"], "setup": s["setup"],
-        "entry": s["entry"], "stop": s["stop"], "tp1": s["tp1"],
-        "t0": s["candle_ts"], "opened": time.time()})
+def next_no(state):
+    state["_seq"] = state.get("_seq", 0) + 1
+    return state["_seq"]
 
 
-def _stats(state):
-    return state.setdefault("_stats", {"tp1": 0, "stop": 0, "expired": 0, "r": 0.0, "by": {}})
+def add_trade(state, s, q, no):
+    tr = {"no": no, "id": s["id"], "symbol": s["symbol"], "side": s["side"], "setup": s["setup"], "q": q,
+          "entry": s["entry"], "stop": s["stop"], "tp1": s["tp1"], "tp2": s["tp2"], "t0": s["candle_ts"],
+          "opened": time.time(), "taken": None, "sent_key": s.get("sent_key"), "tp1_notified": False}
+    state.setdefault("_trades", []).append(tr)
+    return tr
 
 
-def _book(state, tr, outcome, r):
-    st = _stats(state)
-    st[outcome] += 1
-    st["r"] = round(st["r"] + r, 2)
-    b = st.setdefault("by", {}).setdefault(tr["setup"], {"tp1": 0, "stop": 0})
-    if outcome in b:
-        b[outcome] += 1
-
-
-def check_trade(tr, df):
-    """Prüft Kerzen NACH der Signalkerze. -> ('tp1'|'stop'|None, Hinweis)"""
-    t0 = pd.Timestamp(tr["t0"])
-    for c in df[df.time > t0].itertuples():
-        if tr["side"] == "long":
-            hit_stop, hit_tp = c.low <= tr["stop"], c.high >= tr["tp1"]
-        else:
-            hit_stop, hit_tp = c.high >= tr["stop"], c.low <= tr["tp1"]
-        if hit_stop and hit_tp:
-            return "stop", "Stop und Ziel in derselben Kerze, vorsichtig als Stop gewertet"
-        if hit_stop:
-            return "stop", ""
-        if hit_tp:
-            return "tp1", ""
-    return None, ""
-
-
-def stats_line(state):
-    st = state.get("_stats")
-    if not st or not (st["tp1"] + st["stop"] + st["expired"]):
-        return "Bilanz: noch keine abgeschlossene Meldung."
-    n = st["tp1"] + st["stop"]
-    quote = f" ({st['tp1'] / n:.0%} Treffer)" if n else ""
-    return (f"Bilanz: {st['tp1']}x TP1, {st['stop']}x Stop, {st['expired']}x ohne Ergebnis{quote}, "
-            f"Summe {st['r']:+.1f}R")
-
-
-def setup_lines(state):
-    out = []
-    for name, b in (state.get("_stats", {}).get("by", {})).items():
-        n = b["tp1"] + b["stop"]
-        if n:
-            out.append(f"  {name}: {b['tp1']} von {n} bis TP1")
-    return "\n".join(out)
+def _upgrade_trade(state, tr):
+    """Ältere gespeicherte Meldungen auf das aktuelle Format bringen."""
+    if "no" not in tr:
+        tr["no"] = next_no(state)
+    if "tp2" not in tr:
+        d = abs(tr["entry"] - tr["stop"]) * TP2_R
+        tr["tp2"] = round(tr["entry"] + d if tr["side"] == "long" else tr["entry"] - d, 5)
+    tr.setdefault("taken", None); tr.setdefault("tp1_notified", False)
 
 
 def update_trades(state, frames, now, dry):
-    keep = []
+    keep, mode = [], trade_mode()
     for tr in state.get("_trades", []):
+        _upgrade_trade(state, tr)
         df = frames.get(tr["symbol"])
-        res, note = check_trade(tr, df) if df is not None else (None, "")
+        status, r = "open", 0.0
+        if df is not None:
+            sub = df[df.time > pd.Timestamp(tr["t0"])]
+            status, r = simulate_path(tr["side"], tr["entry"], tr["stop"], tr["tp1"], tr["tp2"],
+                                      list(zip(sub.high, sub.low)), mode)
         age_h = (time.time() - tr["opened"]) / 3600
-        head = f"{tr['symbol']} {tr['side'].upper()} ({tr['setup']})"
-        if res == "tp1":
-            _book(state, tr, "tp1", 2.0)
-            msg = f"✅ {head}: TP1 erreicht (+2R)\nEinstieg {tr['entry']} → Ziel {tr['tp1']}"
-        elif res == "stop":
-            _book(state, tr, "stop", -1.0)
-            msg = f"❌ {head}: Stop getroffen (-1R)\nEinstieg {tr['entry']} → Stop {tr['stop']}"
-            if note:
-                msg += f"\n({note})"
-        elif age_h > TRADE_MAX_H:
-            _book(state, tr, "expired", 0.0)
-            msg = f"⏱ {head}: nach {int(age_h)} h weder TP1 noch Stop, ohne Ergebnis geschlossen"
+        head = f"#{tr['no']} {tr['symbol']} {tr['side'].upper()} ({tr['setup']})" + (" – dein Trade" if tr.get("taken") else "")
+        if status == "tp1_open":
+            if not tr["tp1_notified"]:
+                tr["tp1_notified"] = True
+                try:
+                    telegram(f"🎯 {head}: TP1 erreicht (+{TP1_R:g}R). {TP1_SHARE:.0%} Teilgewinn, Stop auf Einstieg "
+                             f"{tr['entry']} (Break-even), Rest läuft bis TP2 {tr['tp2']}.", dry)
+                except Exception as e:
+                    print(f"TP1-Meldung fehlgeschlagen: {scrub(e)}")
+            if age_h > TRADE_MAX_H:
+                status, r = "expired", TP1_SHARE * TP1_R
+            else:
+                keep.append(tr); continue
+        elif status == "open":
+            if age_h > TRADE_MAX_H:
+                status, r = "expired", 0.0
+            else:
+                keep.append(tr); continue
+        rn = book(state, tr, status, r, now)
+        if status == "tp1":
+            msg = f"✅ {head}: TP1 erreicht ({r:+.1f}R)\nEinstieg {tr['entry']} → Ziel {tr['tp1']}"
+        elif status == "tp2":
+            msg = f"✅✅ {head}: TP2 erreicht ({r:+.1f}R gesamt, Teilgewinn + Rest)\nEinstieg {tr['entry']} → Ziel {tr['tp2']}"
+        elif status == "be":
+            msg = f"➖ {head}: nach TP1 auf Break-even ausgestoppt ({r:+.1f}R, Teilgewinn gesichert)"
+        elif status == "stop":
+            msg = f"❌ {head}: Stop getroffen ({r:+.1f}R)\nEinstieg {tr['entry']} → Stop {tr['stop']}"
         else:
-            keep.append(tr)
-            continue
+            msg = f"⏱ {head}: nach {int(age_h)} h ohne Ergebnis geschlossen ({r:+.1f}R)"
+        msg += f"\nNach Kosten: {rn:+.2f}R (Kosten pauschal geschätzt)\n{stats_line(state)}"
+        if state.get("_stats_mine"):
+            msg += f"\n{stats_line(state, 'mine')}"
         try:
-            telegram(msg + "\n" + stats_line(state), dry)
+            telegram(msg, dry)
         except Exception as e:
             print(f"Ergebnis-Meldung fehlgeschlagen: {scrub(e)}")
     state["_trades"] = keep
+
+
+# ---------------- Befehle und Buttons ----------------
+HELP = ("Befehle:\n/status – offene Meldungen mit aktuellem Stand\n/bilanz – Auswertung\n/journal – abgeschlossene Meldungen als CSV\n"
+        "/rein <Nr> – Meldung als deinen Trade markieren\n/raus <Nr> – Meldung als nicht genommen markieren\n"
+        "(Die Buttons unter jeder Meldung machen dasselbe.)\n"
+        "Hinweis: Der Scanner liest Befehle nur bei jedem Lauf, die Antwort kommt also mit Verzögerung.")
+
+
+def mark(state, no, taken):
+    for tr in state.get("_trades", []):
+        if tr.get("no") == no:
+            tr["taken"] = taken
+            if taken is False and tr.get("sent_key"):
+                state.pop(tr["sent_key"], None)       # zählt nicht mehr für den Korrelationsfilter
+            return tr
+    return None
+
+
+def status_text(state, frames):
+    trs = state.get("_trades", [])
+    if not trs:
+        return "Keine offenen Meldungen."
+    lines = []
+    for tr in trs:
+        price, r = r_now(tr, frames.get(tr["symbol"]))
+        stand = f"{r:+.1f}R (Kurs {round(price, 5)})" if price is not None else "Kurs aktuell nicht verfügbar"
+        flag = {True: "dein Trade", False: "nicht genommen"}.get(tr.get("taken"), "nicht markiert")
+        lines.append(f"#{tr.get('no', '?')} {tr['symbol']} {tr['side'].upper()} {tr['setup']}: {stand}, {flag}"
+                     + (" | TP1 erreicht, Stop auf Einstieg" if tr.get("tp1_notified") else ""))
+    return "Offene Meldungen:\n" + "\n".join(lines)
+
+
+def process_updates(state, frames, now, dry, updates=None):
+    """Liest Befehle und Button-Klicks aus Telegram. Nur Chats aus TELEGRAM_CHAT_ID werden beachtet."""
+    allowed = set(chat_ids())
+    if updates is None:
+        if dry or not env("TELEGRAM_TOKEN") or not allowed:
+            return
+        payload = {"timeout": 0, "allowed_updates": ["message", "callback_query"]}
+        if state.get("_offset"):
+            payload["offset"] = state["_offset"]
+        try:
+            updates = tg("getUpdates", payload).get("result", [])
+        except Exception as e:
+            print(f"Telegram-Updates nicht lesbar: {scrub(e)}"); return
+    for u in updates:
+        state["_offset"] = max(state.get("_offset", 0), u["update_id"] + 1)
+        try:
+            cb = u.get("callback_query")
+            msg = u.get("message")
+            if cb and cb.get("message"):
+                chat = str(cb["message"]["chat"]["id"])
+                if chat not in allowed:
+                    continue
+                kind, _, num = (cb.get("data") or "").partition(":")
+                if kind in ("in", "out") and num.isdigit():
+                    tr = mark(state, int(num), kind == "in")
+                    reply = (f"Gespeichert: #{num} ist {'dein Trade' if kind == 'in' else 'nicht genommen'}."
+                             if tr else f"#{num} ist nicht mehr offen oder nicht bekannt.")
+                    telegram(reply, dry, chat=chat)
+                    if not dry:
+                        for method, pl in (("answerCallbackQuery", {"callback_query_id": cb["id"], "text": "Gespeichert"}),
+                                           ("editMessageReplyMarkup", {"chat_id": chat, "message_id": cb["message"]["message_id"],
+                                                                       "reply_markup": {"inline_keyboard": []}})):
+                            try: tg(method, pl)
+                            except Exception: pass
+            elif msg and msg.get("text"):
+                chat = str(msg["chat"]["id"])
+                if chat not in allowed:
+                    print(f"Nachricht von fremdem Chat ignoriert ({chat})"); continue
+                parts = msg["text"].strip().split()
+                cmd = parts[0].split("@")[0].lower()
+                if cmd in ("/start", "/hilfe", "/help"):
+                    telegram(HELP, dry, chat=chat)
+                elif cmd == "/status":
+                    telegram(status_text(state, frames), dry, chat=chat)
+                elif cmd == "/bilanz":
+                    telegram(stats_text(state), dry, chat=chat)
+                elif cmd == "/journal":
+                    data = journal_csv(state)
+                    if data:
+                        telegram_file("sendDocument", data, "journal.csv", "Abgeschlossene Meldungen", dry, chat=chat)
+                    else:
+                        telegram("Noch keine abgeschlossenen Meldungen.", dry, chat=chat)
+                elif cmd in ("/rein", "/raus"):
+                    if len(parts) > 1 and parts[1].lstrip("#").isdigit():
+                        no = int(parts[1].lstrip("#"))
+                        tr = mark(state, no, cmd == "/rein")
+                        telegram((f"Gespeichert: #{no} ist {'dein Trade' if cmd == '/rein' else 'nicht genommen'}."
+                                  if tr else f"#{no} ist nicht offen oder nicht bekannt."), dry, chat=chat)
+                    else:
+                        telegram(f"Bitte mit Nummer, z. B. {cmd} 3", dry, chat=chat)
+        except Exception as e:
+            print(f"Befehl fehlgeschlagen: {scrub(e)}")
 
 
 # ---------------- Hauptprogramm ----------------
@@ -579,6 +984,10 @@ def main():
     print(f"{now:%H:%M} UTC: {len(jobs)} Märkte geprüft, {errors} Fehler, {len(candidates)} neue Kandidaten")
 
     try:
+        process_updates(state, frames, now, a.dry)
+    except Exception as e:
+        print(f"Befehle fehlgeschlagen: {scrub(e)}")
+    try:
         update_trades(state, frames, now, a.dry)
     except Exception as e:
         print(f"Trade-Verfolgung fehlgeschlagen: {scrub(e)}")
@@ -596,10 +1005,14 @@ def main():
             print(f"Bewertung fehlgeschlagen: {scrub(e)}")
             alert_error(state, "claude", f"Claude-Bewertung fehlgeschlagen: {scrub(e)[:150]}", a.dry)
             results = []
-        allowed, infos = apply_limits(results, state, frames)
+        allowed, infos = apply_limits(results, state, frames, now)
         for s, q, text in allowed:
-            telegram(format_msg(s, q, text), a.dry)
-            add_trade(state, s)
+            no = next_no(state)
+            buttons = [{"text": "✅ Ich bin drin", "callback_data": f"in:{no}"},
+                       {"text": "🚫 Nicht genommen", "callback_data": f"out:{no}"}]
+            telegram(format_msg(s, q, text, no), a.dry, buttons=buttons)
+            add_trade(state, s, q, no)
+            send_chart(s, frames.get(s["symbol"]), no, a.dry)
         for msg in infos:
             try:
                 telegram(msg, a.dry)
