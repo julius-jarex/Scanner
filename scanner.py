@@ -75,7 +75,7 @@ def load_env():
 def scrub(text):
     """Zugangsdaten aus Fehlertexten entfernen (URLs enthalten sonst Keys/Token)."""
     text = str(text)
-    for k in ("TWELVEDATA_KEY", "ANTHROPIC_API_KEY", "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "MYFXBOOK_EMAIL", "MYFXBOOK_PASSWORD"):
+    for k in ("TWELVEDATA_KEY", "ANTHROPIC_API_KEY", "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "MYFXBOOK_EMAIL", "MYFXBOOK_PASSWORD", "FRED_API_KEY"):
         v = os.environ.get(k)
         if v:
             text = text.replace(v, "***")
@@ -639,7 +639,9 @@ def book(state, tr, outcome, r, now):
     j.append({"closed": now.strftime("%Y-%m-%d %H:%M"), "no": tr.get("no"), "symbol": tr["symbol"], "side": tr["side"],
               "setup": tr["setup"], "quality": tr.get("q", ""), "signal_candle": tr["t0"], "entry": tr["entry"],
               "stop": tr["stop"], "tp1": tr["tp1"], "outcome": outcome, "r": round(r, 2), "r_net": round(rn, 2),
-              "taken": {True: "ja", False: "nein"}.get(tr.get("taken"), "")})
+              "taken": {True: "ja", False: "nein"}.get(tr.get("taken"), ""),
+              "vix_hoch": {True: "ja", False: "nein"}.get(tr.get("vix_high"), ""),
+              "dollar_stark": {True: "ja", False: "nein"}.get(tr.get("usd_strong"), "")})
     del j[:-500]
     return rn
 
@@ -819,7 +821,8 @@ def next_no(state):
 def add_trade(state, s, q, no):
     tr = {"no": no, "id": s["id"], "symbol": s["symbol"], "side": s["side"], "setup": s["setup"], "q": q,
           "entry": s["entry"], "stop": s["stop"], "tp1": s["tp1"], "tp2": s["tp2"], "t0": s["candle_ts"],
-          "opened": time.time(), "taken": None, "sent_key": s.get("sent_key"), "tp1_notified": False}
+          "opened": time.time(), "taken": None, "sent_key": s.get("sent_key"), "tp1_notified": False,
+          "vix_high": s.get("vix_high"), "usd_strong": s.get("usd_strong")}
     state.setdefault("_trades", []).append(tr)
     return tr
 
@@ -1081,7 +1084,46 @@ def retail_sentiment(sym):
     return None
 
 
-def evaluate_intraday(cands, now, news):
+def _fred_series(sid):
+    key = env("FRED_API_KEY")
+    if key:
+        r = requests.get("https://api.stlouisfed.org/fred/series/observations",
+                         params={"series_id": sid, "api_key": key, "file_type": "json", "observation_start": (datetime.now(timezone.utc) - timedelta(days=500)).strftime("%Y-%m-%d")}, timeout=30)
+        r.raise_for_status()
+        v = pd.to_numeric(pd.DataFrame(r.json()["observations"])["value"], errors="coerce")
+    else:
+        r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv", params={"id": sid}, timeout=(10, 40), headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        d = pd.read_csv(io.StringIO(r.text)); v = pd.to_numeric(d.iloc[:, 1], errors="coerce")
+    return v.dropna().reset_index(drop=True)
+
+
+def macro_context(state, now):
+    """Umfeld für den Live-Test (beeinflusst keine Signale): VIX hoch/niedrig, Dollar stark/schwach. Einmal pro Tag gecacht."""
+    today = now.strftime("%Y-%m-%d")
+    c = state.get("_macro")
+    if c and c.get("date") == today:
+        return c
+    c = {"date": today, "vix_high": None, "usd_strong": None}
+    try:
+        vix = _fred_series("VIXCLS")
+        if len(vix) >= 200: c["vix_high"] = bool(vix.iloc[-1] > vix.iloc[-252:].median())
+    except Exception as e:
+        print(f"VIX nicht verfügbar: {scrub(e)}")
+    try:
+        usd = _fred_series("DTWEXBGS")
+        if len(usd) >= 50: c["usd_strong"] = bool(usd.iloc[-1] > usd.iloc[-50:].mean())
+    except Exception as e:
+        print(f"Dollar-Index nicht verfügbar: {scrub(e)}")
+    parts = [{True: "VIX hoch (über Jahresmittel)", False: "VIX niedrig (unter Jahresmittel)"}.get(c["vix_high"], "VIX unbekannt"),
+             {True: "Dollar stark (über 50-Tage-Schnitt)", False: "Dollar schwach (unter 50-Tage-Schnitt)"}.get(c["usd_strong"], "Dollar unbekannt")]
+    c["text"] = ("Umfeld: " + " | ".join(parts) + ". Nur Info für den Live-Test: Im Backtest liefen Signale bei VIX hoch und bei Dollar stark "
+                 "besser, nicht gesichert, kein Grund ein Signal auszulassen.")
+    state["_macro"] = c
+    return c
+
+
+def evaluate_intraday(cands, now, news, state=None):
     out = []
     for s in cands:
         block, penalty, notes = news_check(s["symbol"], news, now)
@@ -1091,6 +1133,10 @@ def evaluate_intraday(cands, now, news):
         senti = retail_sentiment(s["symbol"])
         if senti:
             text += "\n" + senti
+        if state is not None:
+            mc = macro_context(state, now)
+            s["vix_high"], s["usd_strong"] = mc.get("vix_high"), mc.get("usd_strong")
+            text += "\n" + mc["text"]
         out.append((s, "Intraday", text))
     return out
 
@@ -1258,7 +1304,7 @@ def main():
         for s in candidates:
             state[s["id"]] = time.time()
         news = fetch_news(now) if env("NEWS_CHECK", "1") == "1" else None
-        results = evaluate_intraday(candidates, now, news)
+        results = evaluate_intraday(candidates, now, news, state)
         allowed, infos = apply_limits(results, state, frames, now)
         for s, q, text in allowed:
             no = next_no(state)
