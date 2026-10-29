@@ -43,6 +43,7 @@ COST_OTHER_PCT = 0.0003         # ETFs/Indizes/Öl: angenommener Spread in % vom
 # --- Signal-Bot v2: zwei klar getrennte Signalarten ---
 INTRADAY = {"XAUUSD": "XAU/USD"}            # Gold, 1h-Trend-Rücksetzer im Tagestrend
 INTRADAY_STALE_MIN = 25                      # Signal nur, wenn die 1h-Kerze höchstens so viele Minuten alt ist
+INTRADAY_SHORTS = False                      # Gold-Intraday: False = nur Long-Signale, True = auch Short (Short lag in beiden Testzeiträumen im Minus)
 INTRADAY_SESSION_UTC = (7, 17)               # nur Signalkerzen, die zwischen 07:00 und 17:00 UTC beginnen (Gold-Labor 2, V1)
 SWING = {"XAUUSD": ("twelve", "XAU/USD"), "BTCUSD": ("kraken", "XBTUSD"), "QQQ": ("twelve", "QQQ"),
          "SPY": ("twelve", "SPY"), "SLV": ("twelve", "SLV"), "USO": ("twelve", "USO")}
@@ -50,9 +51,10 @@ SWING_ENTRY_DAYS = 100          # Einstieg bei neuem 100-Tage-Hoch (Schlusskurs)
 SWING_ATR_MULT = 3.0            # Anfangsstop und Nachzieh-Abstand in ATR
 SWING_HOUR_UTC = 7              # tägliche Prüfung ab 07:00 UTC (Tageskerzen sind dann abgeschlossen)
 SWING_MAX_OPEN = 4              # Hinweis, wenn schon so viele Swing-Positionen offen sind
-INTRADAY_EVIDENCE = ("Beleg: schwach. Im Test (Gold 1h, 3,7 Jahre, nur 07-17 UTC) ca. +0,10R pro Trade nach Kosten, "
-                     "besser als zufällige Einstiege im Trend (p<0,01), absolut aber nicht gesichert (t=1,9). "
-                     "Gewinne kamen fast nur aus Long-Trades im Gold-Anstieg, Shorts lagen im Minus. Live erst prüfen, nur Demo oder kleines Risiko.")
+INTRADAY_EVIDENCE = ("Beleg: schwach. Gold 1h, 2020-2026, nur 07-17 UTC: ca. +0,06R (vor 2023, nie zur Entwicklung benutzt) bzw. "
+                     "+0,10R (ab 2023) pro Trade nach Kosten, knapp besser als zufällige Einstiege, statistisch nicht gesichert. "
+                     "Long in beiden Zeiträumen deutlich besser als Short. Auf 8 anderen Märkten nicht bestätigt, 2026 bisher leicht im Minus. "
+                     "Demo oder max. 0,5 % Risiko.")
 SWING_EVIDENCE = ("Beleg: schwach positiv. 20-Jahres-Test über viele Märkte, nur Long: etwa +0,2R pro Trade nach Kosten, "
                   "Trefferquote ca. 38 %. Im Portfolio nur ca. +4 bis +5 % pro Jahr bei 1 % Risiko, mit Rückgängen von 20-35 % "
                   "und Jahren ohne Gewinn. Kein Garant.")
@@ -73,7 +75,7 @@ def load_env():
 def scrub(text):
     """Zugangsdaten aus Fehlertexten entfernen (URLs enthalten sonst Keys/Token)."""
     text = str(text)
-    for k in ("TWELVEDATA_KEY", "ANTHROPIC_API_KEY", "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"):
+    for k in ("TWELVEDATA_KEY", "ANTHROPIC_API_KEY", "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "MYFXBOOK_EMAIL", "MYFXBOOK_PASSWORD"):
         v = os.environ.get(k)
         if v:
             text = text.replace(v, "***")
@@ -1049,9 +1051,34 @@ def intraday_signals(sym, df, trend, now):
 
     if trend == 1 and (w.low <= w.ema20).any() and r.close > r.ema20 > r.ema50 and r.close > r.open:
         add("long", w.low.min() - 0.2 * a)
-    if trend == -1 and (w.high >= w.ema20).any() and r.close < r.ema20 < r.ema50 and r.close < r.open:
+    short_on = str(os.environ.get("INTRADAY_SHORTS", INTRADAY_SHORTS)).lower() in ("1", "true", "ja")
+    if short_on and trend == -1 and (w.high >= w.ema20).any() and r.close < r.ema20 < r.ema50 and r.close < r.open:
         add("short", w.high.max() + 0.2 * a)
     return out
+
+
+def retail_sentiment(sym):
+    """Info-Zeile: Positionierung der Privat-Trader laut Myfxbook (nur wenn MYFXBOOK_EMAIL/PASSWORD gesetzt). Nicht getestet."""
+    email, pw = env("MYFXBOOK_EMAIL"), env("MYFXBOOK_PASSWORD")
+    if not email or not pw:
+        return None
+    try:
+        j = requests.get("https://www.myfxbook.com/api/login.json", params={"email": email, "password": pw}, timeout=20).json()
+        if j.get("error") or not j.get("session"):
+            print(f"Myfxbook-Login fehlgeschlagen: {scrub(j.get('message', ''))}"); return None
+        sess = j["session"]
+        o = requests.get("https://www.myfxbook.com/api/get-community-outlook.json", params={"session": sess}, timeout=20).json()
+        try:
+            requests.get("https://www.myfxbook.com/api/logout.json", params={"session": sess}, timeout=10)
+        except Exception:
+            pass
+        for s in o.get("symbols", []):
+            if str(s.get("name", "")).upper() == sym:
+                return (f"Privat-Trader (Myfxbook): {s.get('longPercentage')} % long, {s.get('shortPercentage')} % short. "
+                        "Nur Info, nicht getestet; extreme Werte gelten eher als Gegen-Signal.")
+    except Exception as e:
+        print(f"Myfxbook nicht verfügbar: {scrub(e)}")
+    return None
 
 
 def evaluate_intraday(cands, now, news):
@@ -1061,6 +1088,9 @@ def evaluate_intraday(cands, now, news):
         if block:
             print(f"{s['id']} unterdrückt: {notes[0]}"); continue
         text = INTRADAY_EVIDENCE + "\nNews: " + ("; ".join(notes) if notes else "keine High-Impact-Termine gefunden")
+        senti = retail_sentiment(s["symbol"])
+        if senti:
+            text += "\n" + senti
         out.append((s, "Intraday", text))
     return out
 
