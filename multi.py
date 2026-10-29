@@ -34,9 +34,15 @@ def fetch_1h(symbol, pages=PAGES):
     for p in range(pages):
         params = {"symbol": symbol, "interval": "1h", "outputsize": 5000, "timezone": "UTC", "apikey": S.env("TWELVEDATA_KEY", required=True)}
         if end: params["end_date"] = end
-        for attempt in range(3):
-            last = requests.get("https://api.twelvedata.com/time_series", params=params, timeout=60).json()
-            if last.get("status") == "error" and "minute" in str(last.get("message", "")).lower() and attempt < 2:
+        for attempt in range(5):
+            try:
+                last = requests.get("https://api.twelvedata.com/time_series", params=params, timeout=60).json()
+            except Exception as e:                       # Verbindungsabbruch o. Ä.: kurz warten, erneut versuchen
+                if attempt < 4:
+                    print(f"Verbindung abgebrochen ({str(e)[:60]}), neuer Versuch ...", flush=True)
+                    time.sleep(20 * (attempt + 1)); continue
+                raise
+            if last.get("status") == "error" and "minute" in str(last.get("message", "")).lower() and attempt < 4:
                 time.sleep(65); continue
             break
         if last.get("status") == "error" or not last.get("values"):
