@@ -22,7 +22,7 @@ MIN_QUALITY = "A"              # im Gratis-Modus nur Setups mit dieser Qualität
 BLACKOUT_MIN = 30              # Minuten vor/nach einem Termin keine Meldung
 MAX_DATA_AGE_MIN = 50          # Kursdaten älter als das gelten als veraltet -> keine Signale
 MAX_CHASE_R = 0.5              # Signal ungültig, wenn Preis mehr als 0,5R vom Einstieg weg ist
-MAX_SIGNALS_PER_DAY = 3        # höchstens so viele Meldungen pro 24 Stunden
+MAX_SIGNALS_PER_DAY = None     # kein Tageslimit für die Anzahl der Meldungen (Zahl eintragen, um es wieder zu aktivieren)
 CORR_HOURS = 8                 # gleiche Marktrichtung (z. B. USD-short) nicht zweimal innerhalb 8 Stunden
 ERR_COOLDOWN_H = 6             # gleiche Fehlermeldung höchstens alle 6 Stunden
 HEARTBEAT_HOUR_UTC = 7         # tägliches Lebenszeichen ab 07:00 UTC
@@ -774,7 +774,7 @@ def apply_limits(results, state, frames=None, now=None):
             else:
                 print(f"{s['id']} unterdrückt: korrelierte Position ({ex}) kürzlich gemeldet")
             continue
-        if len(sent_recent(state, 24)) >= MAX_SIGNALS_PER_DAY:
+        if MAX_SIGNALS_PER_DAY and len(sent_recent(state, 24)) >= MAX_SIGNALS_PER_DAY:
             print(f"{s['id']} unterdrückt: Tageslimit erreicht"); continue
         key = f"sent|{time.time():.3f}|{ex}"
         state[key] = time.time()
