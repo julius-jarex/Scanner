@@ -60,7 +60,7 @@ SWING_EVIDENCE = ("Beleg: schwach positiv. 20-Jahres-Test über viele Märkte, n
                   "und Jahren ohne Gewinn. Kein Garant.")
 # ---------------------------------------------------------------
 
-NAMES = {"swing": "Trailing-Stop", "tp1": "TP1", "tp2": "TP2", "be": "Break-even nach Teilgewinn", "stop": "Stop", "expired": "ohne Ergebnis"}
+NAMES = {"swing": "Trailing-Stop", "tp1": "TP1", "tp2": "TP2", "be": "Break-even nach TP1", "stop": "Stop", "expired": "ohne Ergebnis"}
 
 
 def load_env():
@@ -89,12 +89,8 @@ def env(name, default=None, required=False):
     return v
 
 
-TRADE_MODE_DEFAULT = "simple"   # "simple" = bis TP1 oder Stop | "half" = 50 % beim halben TP1, Stop auf Einstieg, Rest bis TP1 | "partial" = 50 % bei TP1, Rest bis TP2
-
-
 def trade_mode():
-    m = (env("TRADE_MODE", TRADE_MODE_DEFAULT) or "simple").lower()
-    return m if m in ("simple", "partial", "half") else "simple"
+    return "partial" if (env("TRADE_MODE", "simple") or "").lower() == "partial" else "simple"
 
 
 # ---------------- Daten ----------------
@@ -287,25 +283,6 @@ def simulate_path(side, entry, stop, tp1, tp2, hl, mode="simple"):
     partial: bei TP1 Teilgewinn, Stop auf Einstieg, Rest bis TP2 oder Break-even.
     Berühren Stop und Ziel dieselbe Kerze, zählt vorsichtig der Stop."""
     long_ = side == "long"
-    if mode == "half":                 # 50 % beim halben Weg zu TP1, Stop auf Einstieg, Rest bis TP1
-        half = entry + (tp1 - entry) / 2
-        r_half = TP1_SHARE * TP1_R / 2
-        phase = 1
-        for hi, lo in hl:
-            if phase == 1:
-                if (lo <= stop) if long_ else (hi >= stop):
-                    return "stop", -1.0
-                if (hi >= half) if long_ else (lo <= half):
-                    phase = 2
-                    if (hi >= tp1) if long_ else (lo <= tp1):      # halbes und ganzes Ziel in derselben Kerze
-                        return "tp1", r_half + (1 - TP1_SHARE) * TP1_R
-                    continue
-            else:
-                if (lo <= entry) if long_ else (hi >= entry):
-                    return "be", r_half
-                if (hi >= tp1) if long_ else (lo <= tp1):
-                    return "tp1", r_half + (1 - TP1_SHARE) * TP1_R
-        return ("tp1_open", r_half) if phase == 2 else ("open", 0.0)
     r_be = TP1_SHARE * TP1_R
     r_tp2 = TP1_SHARE * TP1_R + (1 - TP1_SHARE) * TP2_R
     phase = 1
@@ -690,9 +667,6 @@ def format_msg(s, quality, text, no=None):
     plan = ""
     if trade_mode() == "partial":
         plan = f"Plan: bei TP1 {TP1_SHARE:.0%} schließen, Stop auf Einstieg, Rest bis TP2.\n"
-    elif trade_mode() == "half":
-        half = round(s['entry'] + (s['tp1'] - s['entry']) / 2, 5)
-        plan = f"Plan: bei {half} (halbes Ziel) {TP1_SHARE:.0%} schließen, Stop auf Einstieg, Rest bis TP1.\n"
     nr = f"#{no} " if no else ""
     return (f"{arrow} {nr}{s['symbol']} | {s['setup']} | {quality}\n"
             f"Kerze: {s['candle_time']} | {s.get('trend_text') or '1h-Trend: ' + str(s.get('htf_trend_1h'))}\n\n"
@@ -879,17 +853,12 @@ def update_trades(state, frames, now, dry):
             if not tr["tp1_notified"]:
                 tr["tp1_notified"] = True
                 try:
-                    if mode == "half":
-                        half = round(tr["entry"] + (tr["tp1"] - tr["entry"]) / 2, 5)
-                        telegram(f"🎯 {head}: halbes Ziel {half} erreicht (+{TP1_R / 2:g}R). Jetzt {TP1_SHARE:.0%} schließen und Stop auf "
-                                 f"Einstieg {tr['entry']} setzen (Break-even). Rest läuft bis TP1 {tr['tp1']}.", dry)
-                    else:
-                        telegram(f"🎯 {head}: TP1 erreicht (+{TP1_R:g}R). {TP1_SHARE:.0%} Teilgewinn, Stop auf Einstieg "
-                                 f"{tr['entry']} (Break-even), Rest läuft bis TP2 {tr['tp2']}.", dry)
+                    telegram(f"🎯 {head}: TP1 erreicht (+{TP1_R:g}R). {TP1_SHARE:.0%} Teilgewinn, Stop auf Einstieg "
+                             f"{tr['entry']} (Break-even), Rest läuft bis TP2 {tr['tp2']}.", dry)
                 except Exception as e:
                     print(f"TP1-Meldung fehlgeschlagen: {scrub(e)}")
             if age_h > TRADE_MAX_H:
-                status, r = "expired", r
+                status, r = "expired", TP1_SHARE * TP1_R
             else:
                 keep.append(tr); continue
         elif status == "open":
@@ -899,11 +868,11 @@ def update_trades(state, frames, now, dry):
                 keep.append(tr); continue
         rn = book(state, tr, status, r, now)
         if status == "tp1":
-            msg = f"✅ {head}: TP1 erreicht ({r:+.2f}R{' gesamt mit Teilgewinn' if mode == 'half' else ''})\nEinstieg {tr['entry']} → Ziel {tr['tp1']}"
+            msg = f"✅ {head}: TP1 erreicht ({r:+.1f}R)\nEinstieg {tr['entry']} → Ziel {tr['tp1']}"
         elif status == "tp2":
             msg = f"✅✅ {head}: TP2 erreicht ({r:+.1f}R gesamt, Teilgewinn + Rest)\nEinstieg {tr['entry']} → Ziel {tr['tp2']}"
         elif status == "be":
-            msg = f"➖ {head}: nach Teilgewinn auf Break-even ausgestoppt ({r:+.2f}R, Teilgewinn gesichert)"
+            msg = f"➖ {head}: nach TP1 auf Break-even ausgestoppt ({r:+.1f}R, Teilgewinn gesichert)"
         elif status == "stop":
             msg = f"❌ {head}: Stop getroffen ({r:+.1f}R)\nEinstieg {tr['entry']} → Stop {tr['stop']}"
         else:
