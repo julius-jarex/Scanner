@@ -29,18 +29,36 @@ HEARTBEAT_HOUR_UTC = 7         # tägliches Lebenszeichen ab 07:00 UTC
 INFO_COOLDOWN_H = 2            # Folgesignal-Infos zu derselben offenen Meldung höchstens alle 2 Stunden
 TRADE_MAX_H = 30               # Meldung ohne Ergebnis nach so vielen Stunden schliessen
 DAILY_LOSS_R = 3.0             # nach diesem Tagesverlust (in R) keine neuen Meldungen mehr (Secret DAILY_LOSS_R überschreibt)
-TP1_R, TP2_R = 2.0, 3.0        # Ziele in Vielfachen des Risikos
+TP1_R, TP2_R = 1.5, 3.0        # Ziele (Intraday) in Vielfachen des Risikos
 TP1_SHARE = 0.5                # Anteil, der bei TP1 geschlossen wird (nur TRADE_MODE=partial)
 # runde Marken je Symbol (Abstand zwischen zwei "runden" Preisen)
 ROUND_STEP = {"EURUSD": 0.005, "GBPUSD": 0.005, "USDJPY": 0.5, "XAUUSD": 10.0,
               "BTCUSD": 1000.0, "ETHUSD": 50.0, "SOLUSD": 5.0, "AUDUSD": 0.005, "USDCAD": 0.005,
               "XRPUSD": 0.1, "ADAUSD": 0.05, "LINKUSD": 1.0}
 # angenommene Kosten (Spread/Gebühren) je Trade: Forex/Gold absolut in Preis, Krypto in % vom Preis (Secret COST_CRYPTO_PCT)
-COST_ABS = {"EURUSD": 0.00010, "GBPUSD": 0.00012, "USDJPY": 0.010, "XAUUSD": 0.30, "AUDUSD": 0.00012, "USDCAD": 0.00015}
+COST_ABS = {"EURUSD": 0.00010, "GBPUSD": 0.00012, "USDJPY": 0.010, "XAUUSD": 0.20, "AUDUSD": 0.00012, "USDCAD": 0.00015}
 COST_CRYPTO_PCT = 0.001
+COST_OTHER_PCT = 0.0003         # ETFs/Indizes/Öl: angenommener Spread in % vom Preis
+
+# --- Signal-Bot v2: zwei klar getrennte Signalarten ---
+INTRADAY = {"XAUUSD": "XAU/USD"}            # Gold, 1h-Trend-Rücksetzer im Tagestrend
+INTRADAY_STALE_MIN = 25                      # Signal nur, wenn die 1h-Kerze höchstens so viele Minuten alt ist
+INTRADAY_SESSION_UTC = (7, 17)               # nur Signalkerzen, die zwischen 07:00 und 17:00 UTC beginnen (Gold-Labor 2, V1)
+SWING = {"XAUUSD": ("twelve", "XAU/USD"), "BTCUSD": ("kraken", "XBTUSD"), "QQQ": ("twelve", "QQQ"),
+         "SPY": ("twelve", "SPY"), "SLV": ("twelve", "SLV"), "USO": ("twelve", "USO")}
+SWING_ENTRY_DAYS = 100          # Einstieg bei neuem 100-Tage-Hoch (Schlusskurs), nur Long
+SWING_ATR_MULT = 3.0            # Anfangsstop und Nachzieh-Abstand in ATR
+SWING_HOUR_UTC = 7              # tägliche Prüfung ab 07:00 UTC (Tageskerzen sind dann abgeschlossen)
+SWING_MAX_OPEN = 4              # Hinweis, wenn schon so viele Swing-Positionen offen sind
+INTRADAY_EVIDENCE = ("Beleg: schwach. Im Test (Gold 1h, 3,7 Jahre, nur 07-17 UTC) ca. +0,10R pro Trade nach Kosten, "
+                     "besser als zufällige Einstiege im Trend (p<0,01), absolut aber nicht gesichert (t=1,9). "
+                     "Gewinne kamen fast nur aus Long-Trades im Gold-Anstieg, Shorts lagen im Minus. Live erst prüfen, nur Demo oder kleines Risiko.")
+SWING_EVIDENCE = ("Beleg: schwach positiv. 20-Jahres-Test über viele Märkte, nur Long: etwa +0,2R pro Trade nach Kosten, "
+                  "Trefferquote ca. 38 %. Im Portfolio nur ca. +4 bis +5 % pro Jahr bei 1 % Risiko, mit Rückgängen von 20-35 % "
+                  "und Jahren ohne Gewinn. Kein Garant.")
 # ---------------------------------------------------------------
 
-NAMES = {"tp1": "TP1", "tp2": "TP2", "be": "Break-even nach TP1", "stop": "Stop", "expired": "ohne Ergebnis"}
+NAMES = {"swing": "Trailing-Stop", "tp1": "TP1", "tp2": "TP2", "be": "Break-even nach TP1", "stop": "Stop", "expired": "ohne Ergebnis"}
 
 
 def load_env():
@@ -74,8 +92,8 @@ def trade_mode():
 
 
 # ---------------- Daten ----------------
-def fetch_kraken(pair):
-    r = requests.get("https://api.kraken.com/0/public/OHLC", params={"pair": pair, "interval": 15}, timeout=20)
+def fetch_kraken(pair, interval=15):
+    r = requests.get("https://api.kraken.com/0/public/OHLC", params={"pair": pair, "interval": interval}, timeout=20)
     r.raise_for_status()
     j = r.json()
     if j.get("error"):
@@ -165,7 +183,12 @@ def next_level(side, entry, levels):
 def cost_r(sym, entry, risk):
     if not risk:
         return 0.0
-    c = COST_ABS[sym] if sym in COST_ABS else entry * float(env("COST_CRYPTO_PCT", COST_CRYPTO_PCT))
+    if sym in COST_ABS:
+        c = COST_ABS[sym]
+    elif sym in CRYPTO:
+        c = entry * float(env("COST_CRYPTO_PCT", COST_CRYPTO_PCT))
+    else:
+        c = entry * COST_OTHER_PCT
     return c / risk
 
 
@@ -181,7 +204,9 @@ def size(sym, entry, stop):
         if lots < 0.01:
             return f"unter 0.01 Lots möglich (bei 0.01 Lots Risiko {per_lot * 0.01:.2f} statt {risk:.2f}), eher auslassen"
         return f"{lots:.2f} Lots (Risiko ca. {lots * per_lot:.2f} von {risk:.2f})"
-    return f"{risk / dist:.4f} {sym[:3]} (Risiko {risk:.2f}, ohne Hebel)"
+    if sym in CRYPTO:
+        return f"{risk / dist:.4f} {sym[:3]} (Risiko {risk:.2f}, ohne Hebel)"
+    return f"{risk / dist:.2f} Stück/Einheiten (Risiko {risk:.2f}; Kontraktgröße beim Broker prüfen)"
 
 
 def find_setups(sym, df):
@@ -639,8 +664,8 @@ def format_msg(s, quality, text, no=None):
     if trade_mode() == "partial":
         plan = f"Plan: bei TP1 {TP1_SHARE:.0%} schließen, Stop auf Einstieg, Rest bis TP2.\n"
     nr = f"#{no} " if no else ""
-    return (f"{arrow} {nr}{s['symbol']} | {s['setup']} | Qualität {quality}\n"
-            f"Kerze: {s['candle_time']} | 1h-Trend: {s['htf_trend_1h']}\n\n"
+    return (f"{arrow} {nr}{s['symbol']} | {s['setup']} | {quality}\n"
+            f"Kerze: {s['candle_time']} | {s.get('trend_text') or '1h-Trend: ' + str(s.get('htf_trend_1h'))}\n\n"
             f"Einstieg: {s['entry']}\nStop: {s['stop']}\nTP1 ({TP1_R:g}R): {s['tp1']}\nTP2 ({TP2_R:g}R): {s['tp2']}\n"
             f"{level}Größe: {s['size']}\n{plan}{expiry}\n\n{text}\n\n"
             f"Nur Hinweis, keine Anlageberatung. Preis, Größe und News vor der Order selbst prüfen.")
@@ -865,7 +890,7 @@ HELP = ("Befehle:\n/status – offene Meldungen mit aktuellem Stand\n/bilanz –
 
 
 def mark(state, no, taken):
-    for tr in state.get("_trades", []):
+    for tr in list(state.get("_trades", [])) + list(state.get("_swing", {}).values()):
         if tr.get("no") == no:
             tr["taken"] = taken
             if taken is False and tr.get("sent_key"):
@@ -876,9 +901,14 @@ def mark(state, no, taken):
 
 def status_text(state, frames):
     trs = state.get("_trades", [])
-    if not trs:
+    sw = state.get("_swing", {})
+    if not trs and not sw:
         return "Keine offenen Meldungen."
     lines = []
+    for p in sw.values():
+        r = (p.get("close", p["entry"]) - p["entry"]) / p["risk"]
+        flag = {True: "dein Trade", False: "nicht genommen"}.get(p.get("taken"), "nicht markiert")
+        lines.append(f"#{p['no']} SWING {p['symbol']} LONG seit {p['t0'][:10]}: {r:+.1f}R (Schluss {round(p.get('close', p['entry']), 4)}), Stop {round(p['stop'], 4)}, {flag}")
     for tr in trs:
         price, r = r_now(tr, frames.get(tr["symbol"]))
         stand = f"{r:+.1f}R (Kurs {round(price, 5)})" if price is not None else "Kurs aktuell nicht verfügbar"
@@ -952,6 +982,199 @@ def process_updates(state, frames, now, dry, updates=None):
             print(f"Befehl fehlgeschlagen: {scrub(e)}")
 
 
+# ---------------- Signal-Bot v2: Daten ----------------
+def fetch_twelve_tf(symbol, interval, n, drop_last=True):
+    r = requests.get("https://api.twelvedata.com/time_series", params={
+        "symbol": symbol, "interval": interval, "outputsize": n, "timezone": "UTC",
+        "apikey": env("TWELVEDATA_KEY", required=True)}, timeout=30)
+    j = r.json()
+    if j.get("status") == "error":
+        raise RuntimeError(j.get("message"))
+    df = pd.DataFrame(j["values"])
+    df["time"] = pd.to_datetime(df["datetime"], utc=True)
+    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
+    df = df.sort_values("time")[["time", "open", "high", "low", "close"]].reset_index(drop=True)
+    return df.iloc[:-1].reset_index(drop=True) if drop_last else df
+
+
+def fetch_daily(kind, sym, now):
+    """Abgeschlossene Tageskerzen (die heutige, laufende wird entfernt)."""
+    if kind == "kraken":
+        df = fetch_kraken(sym, 1440)[["time", "open", "high", "low", "close"]]
+    else:
+        df = fetch_twelve_tf(sym, "1day", 160, drop_last=False)
+    df = df[df.time.dt.date < now.date()].reset_index(drop=True)
+    if df.empty or (now - df.time.iloc[-1].to_pydatetime()).days > 6:
+        raise RuntimeError("Tagesdaten veraltet oder leer")
+    return df
+
+
+def daily_trend_value(dd):
+    """+1 / -1 / 0 aus Tageskerzen (EMA20 gegen EMA50 und Schlusskurs), nur abgeschlossene Kerzen."""
+    e20 = dd.close.ewm(span=20, adjust=False).mean().iloc[-1]
+    e50 = dd.close.ewm(span=50, adjust=False).mean().iloc[-1]
+    c = dd.close.iloc[-1]
+    return 1 if (e20 > e50 and c > e50) else -1 if (e20 < e50 and c < e50) else 0
+
+
+# ---------------- Signal-Bot v2: Intraday (Gold, 1h-Rücksetzer im Tagestrend) ----------------
+def intraday_signals(sym, df, trend, now):
+    d = add_ind(df.copy())
+    if len(d) < 60 or trend == 0:
+        return []
+    r = d.iloc[-1]
+    a = r.atr
+    if pd.isna(a):
+        return []
+    if not (INTRADAY_SESSION_UTC[0] <= r.time.hour < INTRADAY_SESSION_UTC[1]):
+        return []
+    age_min = (pd.Timestamp(now) - (r.time + pd.Timedelta(hours=1))).total_seconds() / 60
+    if age_min > INTRADAY_STALE_MIN:
+        return []
+    w = d.iloc[-6:]
+    out = []
+
+    def add(side, stop):
+        entry = float(r.close)
+        risk = abs(entry - stop)
+        if not (0.5 * a <= risk <= 3 * a):
+            return
+        sg = 1 if side == "long" else -1
+        out.append({"id": f"{sym}|Rücksetzer 1h|{side}", "symbol": sym, "setup": "Rücksetzer 1h (Tagestrend)", "side": side,
+                    "candle_time": r.time.strftime("%Y-%m-%d %H:%M UTC"), "candle_ts": r.time.isoformat(),
+                    "entry": round(entry, 5), "stop": round(float(stop), 5),
+                    "tp1": round(entry + sg * TP1_R * risk, 5), "tp2": round(entry + sg * TP2_R * risk, 5),
+                    "risk_dist": float(risk), "trend_text": "Tagestrend " + ("aufwärts" if trend == 1 else "abwärts"),
+                    "size": size(sym, entry, stop)})
+
+    if trend == 1 and (w.low <= w.ema20).any() and r.close > r.ema20 > r.ema50 and r.close > r.open:
+        add("long", w.low.min() - 0.2 * a)
+    if trend == -1 and (w.high >= w.ema20).any() and r.close < r.ema20 < r.ema50 and r.close < r.open:
+        add("short", w.high.max() + 0.2 * a)
+    return out
+
+
+def evaluate_intraday(cands, now, news):
+    out = []
+    for s in cands:
+        block, penalty, notes = news_check(s["symbol"], news, now)
+        if block:
+            print(f"{s['id']} unterdrückt: {notes[0]}"); continue
+        text = INTRADAY_EVIDENCE + "\nNews: " + ("; ".join(notes) if notes else "keine High-Impact-Termine gefunden")
+        out.append((s, "Intraday", text))
+    return out
+
+
+# ---------------- Signal-Bot v2: Swing (Tages-Trend, nur Long) ----------------
+def swing_signal(sym, df):
+    d = add_ind(df.copy())
+    if len(d) < SWING_ENTRY_DAYS + 20:
+        return None
+    hh = d.close.rolling(SWING_ENTRY_DAYS).max().shift(1)
+    r = d.iloc[-1]
+    if pd.isna(r.atr) or not (r.close > hh.iloc[-1]):
+        return None
+    risk = SWING_ATR_MULT * float(r.atr)
+    entry = float(r.close)
+    return {"symbol": sym, "entry": entry, "atr": float(r.atr), "risk": risk, "stop": entry - risk, "init_stop": entry - risk,
+            "best": entry, "t0": r.time.isoformat(), "last": r.time.isoformat(), "close": entry,
+            "size": size(sym, entry, entry - risk)}
+
+
+def swing_msg(p, n_open):
+    e, risk = p["entry"], p["risk"]
+    note = (f"\nAchtung: schon {n_open} Swing-Positionen offen (Hinweisgrenze {SWING_MAX_OPEN}). Nur zusätzlich eingehen, "
+            "wenn du das Gesamtrisiko bewusst trägst.") if n_open >= SWING_MAX_OPEN else ""
+    return (f"📈 SWING LONG #{p['no']} {p['symbol']} | Tages-Trend (neues {SWING_ENTRY_DAYS}-Tage-Hoch)\n"
+            f"Tageskerze: {p['t0'][:10]}\n\n"
+            f"Einstieg: ca. {round(e, 5)} (Marktpreis, nicht über {round(e + MAX_CHASE_R * risk, 5)} einsteigen)\n"
+            f"Stop: {round(p['stop'], 5)} ({SWING_ATR_MULT:g} ATR)\nGröße: {p['size']}\n\n"
+            f"Kein festes Ziel. Stop täglich nachziehen: höchster Schlusskurs seit Einstieg minus {SWING_ATR_MULT:g} ATR "
+            f"(ATR beim Einstieg {round(p['atr'], 5)}). Der Bot meldet jeden neuen Stop.{note}\n\n"
+            f"{SWING_EVIDENCE}\n\nNur Hinweis, keine Anlageberatung. Preis, Größe und Termine vor der Order selbst prüfen.")
+
+
+def swing_update(state, sym, df, now, dry):
+    """Nachziehen oder Beenden einer offenen Swing-Position anhand neuer Tageskerzen."""
+    p = state["_swing"].get(sym)
+    if not p:
+        return
+    old_stop = p["stop"]
+    for _, r in df[df.time > pd.Timestamp(p["last"])].iterrows():
+        if r.low <= p["stop"]:
+            ex = min(p["stop"], float(r.open))
+            g = (ex - p["entry"]) / p["risk"]
+            tr = {"symbol": sym, "side": "long", "setup": "Tages-Trend", "entry": p["entry"], "stop": p["init_stop"],
+                  "t0": p["t0"], "q": "Swing", "no": p["no"], "taken": p.get("taken"), "tp1": 0}
+            rn = book(state, tr, "swing", g, now)
+            del state["_swing"][sym]
+            msg = (f"🏁 SWING #{p['no']} {sym} beendet: Trailing-Stop {round(p['stop'], 5)} getroffen (Ausstieg ca. {round(ex, 5)})\n"
+                   f"Ergebnis {g:+.1f}R, nach Kosten {rn:+.2f}R. Einstieg war {round(p['entry'], 5)} am {p['t0'][:10]}.\n{stats_line(state)}")
+            try:
+                telegram(msg, dry)
+            except Exception as e:
+                print(f"Swing-Ende-Meldung fehlgeschlagen: {scrub(e)}")
+            return
+        p["best"] = max(p["best"], float(r.close))
+        p["stop"] = max(p["stop"], p["best"] - SWING_ATR_MULT * p["atr"])
+        p["last"] = r.time.isoformat()
+        p["close"] = float(r.close)
+    p["moved"] = p["stop"] > old_stop + 1e-9
+
+
+def swing_run(state, now, dry):
+    """Einmal täglich: Tageskerzen holen, offene Positionen nachziehen, neue Signale prüfen."""
+    today = now.strftime("%Y-%m-%d")
+    done = state.setdefault("_swing_done", {})
+    state.setdefault("_swing", {})
+    errors, fetched = 0, 0
+    for sym, (kind, ts) in SWING.items():
+        if done.get(sym) == today:
+            continue
+        if kind == "twelve" and not env("TWELVEDATA_KEY"):
+            continue
+        try:
+            if kind == "twelve" and fetched:
+                time.sleep(9)                       # Twelve Data: höchstens 8 Abrufe pro Minute
+            df = fetch_daily(kind, ts, now)
+            fetched += 1 if kind == "twelve" else 0
+        except Exception as e:
+            errors += 1
+            print(f"[Swing {sym}] Fehler: {scrub(e)}")
+            alert_error(state, f"swing-{sym}", f"Swing {sym}: {scrub(e)[:150]}", dry)
+            continue
+        if sym in state["_swing"]:
+            swing_update(state, sym, df, now, dry)
+        if sym not in state["_swing"]:
+            sig = swing_signal(sym, df)
+            if sig:
+                sig["no"] = next_no(state)
+                sig["taken"] = None
+                n_open = len(state["_swing"])
+                state["_swing"][sym] = sig
+                buttons = [{"text": "✅ Ich bin drin", "callback_data": f"in:{sig['no']}"},
+                           {"text": "🚫 Nicht genommen", "callback_data": f"out:{sig['no']}"}]
+                try:
+                    telegram(swing_msg(sig, n_open), dry, buttons=buttons)
+                except Exception as e:
+                    print(f"Swing-Meldung fehlgeschlagen: {scrub(e)}")
+        done[sym] = today
+    # Tagesübersicht der offenen Positionen
+    open_p = list(state["_swing"].values())
+    if open_p and all(done.get(s) == today for s in SWING if (SWING[s][0] != "twelve" or env("TWELVEDATA_KEY"))) and state.get("_swing_msg") != today:
+        lines = []
+        for p in open_p:
+            r = (p.get("close", p["entry"]) - p["entry"]) / p["risk"]
+            lines.append(f"#{p['no']} {p['symbol']}: Schluss {round(p.get('close', p['entry']), 4)} ({r:+.1f}R), neuer Stop {round(p['stop'], 4)}"
+                         + (" (nachgezogen)" if p.get("moved") else ""))
+        try:
+            telegram("📋 Swing-Übersicht (Tagesschluss)\n" + "\n".join(lines) + "\nStop jeweils beim Broker nachziehen, falls du die Position hältst.", dry)
+            state["_swing_msg"] = today
+        except Exception as e:
+            print(f"Swing-Übersicht fehlgeschlagen: {scrub(e)}")
+    return errors
+
+
 # ---------------- Hauptprogramm ----------------
 def main():
     ap = argparse.ArgumentParser()
@@ -964,24 +1187,30 @@ def main():
 
     now = datetime.now(timezone.utc)
     state = load_state()
-    forex_open = now.weekday() < 5 and FOREX_HOURS_UTC[0] <= now.hour < FOREX_HOURS_UTC[1]
-    jobs = [(n, lambda p=p: fetch_kraken(p)) for n, p in CRYPTO.items()]
-    if forex_open and env("TWELVEDATA_KEY"):
-        jobs += [(n, lambda s=s: fetch_twelve(s)) for n, s in FOREX.items()]
+    window = now.weekday() < 5 and FOREX_HOURS_UTC[0] <= now.hour < FOREX_HOURS_UTC[1]
+    candidates, errors, frames, checked = [], 0, {}, 0
 
-    candidates, errors, frames = [], 0, {}
-    for name, fetch in jobs:
-        try:
-            df = check_fresh(name, fetch(), now)
-            frames[name] = df
-            for s in find_setups(name, df):
-                if time.time() - state.get(s["id"], 0) > COOLDOWN_H * 3600:
-                    candidates.append(s)
-        except Exception as e:
-            errors += 1
-            print(f"[{name}] Fehler: {scrub(e)}")
-            alert_error(state, name, f"{name}: {scrub(e)[:150]}", a.dry)
-    print(f"{now:%H:%M} UTC: {len(jobs)} Märkte geprüft, {errors} Fehler, {len(candidates)} neue Kandidaten")
+    # Intraday: Gold, 1h-Kerzen, Tagestrend als Filter
+    if window and env("TWELVEDATA_KEY"):
+        for name, ts in INTRADAY.items():
+            checked += 1
+            try:
+                h1 = fetch_twelve_tf(ts, "1h", 300)
+                if (now - h1.time.iloc[-1].to_pydatetime()).total_seconds() / 60 > 130:
+                    raise RuntimeError("Kursdaten veraltet")
+                frames[name] = h1
+                time.sleep(2)
+                dd = fetch_twelve_tf(ts, "1day", 120, drop_last=False)
+                dd = dd[dd.time.dt.date < now.date()].reset_index(drop=True)
+                trend = daily_trend_value(dd)
+                for s in intraday_signals(name, h1, trend, now):
+                    if time.time() - state.get(s["id"], 0) > COOLDOWN_H * 3600:
+                        candidates.append(s)
+            except Exception as e:
+                errors += 1
+                print(f"[{name}] Fehler: {scrub(e)}")
+                alert_error(state, name, f"{name}: {scrub(e)[:150]}", a.dry)
+    print(f"{now:%H:%M} UTC: {checked} Intraday-Märkte geprüft, {errors} Fehler, {len(candidates)} neue Kandidaten")
 
     try:
         process_updates(state, frames, now, a.dry)
@@ -999,12 +1228,7 @@ def main():
         for s in candidates:
             state[s["id"]] = time.time()
         news = fetch_news(now) if env("NEWS_CHECK", "1") == "1" else None
-        try:
-            results = evaluate(candidates, now, news)
-        except Exception as e:
-            print(f"Bewertung fehlgeschlagen: {scrub(e)}")
-            alert_error(state, "claude", f"Claude-Bewertung fehlgeschlagen: {scrub(e)[:150]}", a.dry)
-            results = []
+        results = evaluate_intraday(candidates, now, news)
         allowed, infos = apply_limits(results, state, frames, now)
         for s, q, text in allowed:
             no = next_no(state)
@@ -1019,7 +1243,15 @@ def main():
             except Exception as e:
                 print(f"Info-Meldung fehlgeschlagen: {scrub(e)}")
 
-    heartbeat(state, now, len(jobs), errors, a.dry)
+    # Swing: einmal täglich ab 07:00 UTC
+    if now.hour >= SWING_HOUR_UTC:
+        try:
+            errors += swing_run(state, now, a.dry)
+            checked += len(SWING)
+        except Exception as e:
+            print(f"Swing-Lauf fehlgeschlagen: {scrub(e)}")
+
+    heartbeat(state, now, checked, errors, a.dry)
     save_state(state)
 
 
