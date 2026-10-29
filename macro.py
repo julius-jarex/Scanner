@@ -22,14 +22,30 @@ SERIES = ["DTWEXBGS", "DFII10", "VIXCLS", "T10YIE"]
 
 
 def fetch_fred(sid):
-    r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv", params={"id": sid}, timeout=60,
-                     headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-    d = pd.read_csv(io.StringIO(r.text))
-    dcol = "observation_date" if "observation_date" in d else d.columns[0]
-    d["date"] = pd.to_datetime(d[dcol], utc=True)
-    d["v"] = pd.to_numeric(d[sid] if sid in d else d.iloc[:, 1], errors="coerce")
-    return d.dropna(subset=["v"])[["date", "v"]].sort_values("date").reset_index(drop=True)
+    """Erst offizielle FRED-API (wenn FRED_API_KEY gesetzt), sonst CSV-Download; jeweils mehrere Versuche."""
+    import time
+    key, last = S.env("FRED_API_KEY"), None
+    for attempt in range(4):
+        try:
+            if key:
+                r = requests.get("https://api.stlouisfed.org/fred/series/observations",
+                                 params={"series_id": sid, "api_key": key, "file_type": "json", "observation_start": "2005-01-01"}, timeout=90)
+                r.raise_for_status()
+                d = pd.DataFrame(r.json()["observations"])
+                d["date"] = pd.to_datetime(d["date"], utc=True); d["v"] = pd.to_numeric(d["value"], errors="coerce")
+            else:
+                r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv", params={"id": sid, "cosd": "2005-01-01"},
+                                 timeout=(20, 120), headers={"User-Agent": "Mozilla/5.0 (compatible; research-script)"})
+                r.raise_for_status()
+                d = pd.read_csv(io.StringIO(r.text))
+                dcol = "observation_date" if "observation_date" in d else d.columns[0]
+                d["date"] = pd.to_datetime(d[dcol], utc=True)
+                d["v"] = pd.to_numeric(d[sid] if sid in d else d.iloc[:, 1], errors="coerce")
+            return d.dropna(subset=["v"])[["date", "v"]].sort_values("date").reset_index(drop=True)
+        except Exception as e:
+            last = e
+            time.sleep(15 * (attempt + 1))
+    raise RuntimeError(S.scrub(last)[:120])
 
 
 def _flag(cond, ref):
@@ -98,7 +114,8 @@ def main():
             notes.append(f"{sid}: {str(e)[:80]}")
     missing = [s for s in SERIES if s not in fred]
     if missing:
-        S.telegram(f"⚠️ Makro-Test abgebrochen, FRED-Daten fehlen: {', '.join(missing)}. {' | '.join(notes)}", a.dry); sys.exit(1)
+        tip = ("" if S.env("FRED_API_KEY") else " Tipp: kostenlosen FRED-API-Schlüssel anlegen (fredaccount.stlouisfed.org) und als Secret FRED_API_KEY speichern.")
+        S.telegram(f"⚠️ Makro-Test abgebrochen, FRED-Daten fehlen: {', '.join(missing)}. {' | '.join(notes)[:600]}{tip}", a.dry); sys.exit(1)
     try:
         raw = M.fetch_1h("XAU/USD", 12)
     except Exception as e:
