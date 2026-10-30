@@ -1,0 +1,23 @@
+name: gold15
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gold15:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python gold5.py --tf 15min
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVEDATA_KEY: ${{ secrets.TWELVEDATA_KEY }}
+          COST_CRYPTO_PCT: ${{ vars.COST_CRYPTO_PCT }}
