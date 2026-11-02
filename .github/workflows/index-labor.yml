@@ -1,0 +1,92 @@
+name: Index Labor (Nasdaq, S&P 500, Dow, DAX)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # 1) S&P 500, Dow und DAX laden gleichzeitig (Nasdaq kommt aus dem ORB-Labor)
+  laden:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    strategy:
+      fail-fast: false
+      matrix:
+        sym: [USA500IDXUSD, USA30IDXUSD, DEUIDXEUR]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy pandas
+      - name: Gespeicherte Daten holen
+        uses: actions/cache@v4
+        with:
+          path: daten/duka/${{ matrix.sym }}
+          key: duka-${{ matrix.sym }}-${{ github.run_id }}
+          restore-keys: duka-${{ matrix.sym }}-
+      - name: Fehlende Tage laden
+        run: python -u range_sweep_mss_labor.py --laden ${{ matrix.sym }}
+
+  # 2) Alle drei Strategien auf allen vier Indizes
+  backtest:
+    needs: laden
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy pandas
+      - name: Nasdaq-Daten aus dem ORB-Labor
+        uses: actions/cache/restore@v4
+        with:
+          path: daten
+          key: orb-daten-${{ github.run_id }}
+          restore-keys: orb-daten-
+      - uses: actions/cache/restore@v4
+        with:
+          path: daten/duka/USA500IDXUSD
+          key: duka-USA500IDXUSD-${{ github.run_id }}
+          restore-keys: duka-USA500IDXUSD-
+      - uses: actions/cache/restore@v4
+        with:
+          path: daten/duka/USA30IDXUSD
+          key: duka-USA30IDXUSD-${{ github.run_id }}
+          restore-keys: duka-USA30IDXUSD-
+      - uses: actions/cache/restore@v4
+        with:
+          path: daten/duka/DEUIDXEUR
+          key: duka-DEUIDXEUR-${{ github.run_id }}
+          restore-keys: duka-DEUIDXEUR-
+
+      - name: Backtest laufen lassen
+        run: |
+          for s in USA500IDXUSD USA30IDXUSD DEUIDXEUR; do echo "$s: $(ls daten/duka/$s 2>/dev/null | wc -l) Tage geladen"; done | tee ergebnis.txt
+          echo "" | tee -a ergebnis.txt
+          python -u index_labor.py | tee -a ergebnis.txt
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat ergebnis.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Ergebnis per Telegram senden
+        if: always()
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TOKEN" ] || [ -z "$CHAT" ]; then echo "Telegram-Secrets fehlen"; exit 0; fi
+          [ -f ergebnis.txt ] || echo "Lauf abgebrochen, kein Ergebnis." > ergebnis.txt
+          KURZ=$(grep -E "^ERGEBNIS|Tage geladen" ergebnis.txt | head -c 3000)
+          curl -s -X POST "https://api.telegram.org/bot$TOKEN/sendMessage" \
+            --data-urlencode "chat_id=$CHAT" \
+            --data-urlencode "text=Index Labor fertig: ${KURZ:-siehe Datei}" > /dev/null
+          curl -s -F "chat_id=$CHAT" -F "document=@ergebnis.txt" \
+            "https://api.telegram.org/bot$TOKEN/sendDocument" > /dev/null
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ergebnis
+          path: ergebnis.txt
