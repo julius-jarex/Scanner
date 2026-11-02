@@ -80,21 +80,21 @@ DEFAULT_MARKETS = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "BTCUSDT", 
 START = "2023-01-01"
 
 
-def _get(url, tries=4):
+def _get(url, tries=3):
     import time
     import urllib.error
     import urllib.request
     for a in range(tries):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urllib.request.urlopen(req, timeout=15) as r:
                 return r.read()
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 return b""
         except Exception:
             pass
-        time.sleep(1.5 * (a + 1))
+        time.sleep(1 + a)
     return None
 
 
@@ -142,33 +142,57 @@ def _binance_month(sym, ym):
 
 
 def download(markets, folder):
-    from concurrent.futures import ThreadPoolExecutor
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     os.makedirs(folder, exist_ok=True)
     end = pd.Timestamp.now(tz="UTC").normalize().tz_localize(None)
     for sym in markets:
         if all(os.path.exists(os.path.join(folder, f"{sym}_{tf}.csv")) for tf in ("15m", "1h")):
-            print(f"{sym}: Daten schon vorhanden")
+            print(f"{sym}: Daten schon vorhanden (aus Cache)", flush=True)
             continue
         is_crypto = sym.upper().endswith("USDT")
-        print(f"{sym}: lade Daten ab {START} ...", flush=True)
         if is_crypto:
-            months = pd.period_range(START, end - pd.Timedelta(days=1), freq="M").strftime("%Y-%m")
-            jobs = [lambda m=m: _binance_month(sym.upper(), m) for m in months]
+            keys = list(pd.period_range(START, end - pd.Timedelta(days=1), freq="M").strftime("%Y-%m"))
+            fetch = lambda k, s=sym.upper(): _binance_month(s, k)
         else:
-            days = [d.date() for d in pd.date_range(START, end - pd.Timedelta(days=1), freq="D")
+            keys = [d.date() for d in pd.date_range(START, end - pd.Timedelta(days=1), freq="D")
                     if d.dayofweek != 5]
-            jobs = [lambda d=d: _duka_day(sym, d) for d in days]
-        with ThreadPoolExecutor(16) as ex:
-            parts = [p for p in ex.map(lambda f: f(), jobs) if p is not None and len(p)]
-        if not parts:
-            print(f"{sym}: KEINE DATEN erhalten, übersprungen")
+            fetch = lambda k, s=sym: _duka_day(s, k)
+
+        # Schnelltest: kommt überhaupt etwas an? Sonst Markt sofort überspringen.
+        probe = keys[-12:-2] if len(keys) > 12 else keys
+        t0 = time.time()
+        with ThreadPoolExecutor(10) as ex:
+            ok = sum(1 for p in ex.map(fetch, probe) if p is not None and len(p))
+        if ok == 0:
+            print(f"{sym}: Datenquelle antwortet nicht ({time.time()-t0:.0f}s), übersprungen", flush=True)
             continue
+
+        print(f"{sym}: lade {len(keys)} Dateien ab {START} ...", flush=True)
+        parts, failed, done = [], 0, 0
+        t0 = time.time()
+        with ThreadPoolExecutor(24) as ex:
+            futs = [ex.submit(fetch, k) for k in keys]
+            for f in as_completed(futs):
+                done += 1
+                p = f.result()
+                if p is None:
+                    failed += 1
+                elif len(p):
+                    parts.append(p)
+                if done % max(1, len(keys) // 5) == 0:
+                    print(f"   {sym}: {done}/{len(keys)} ({time.time()-t0:.0f}s)", flush=True)
+        if not parts:
+            print(f"{sym}: KEINE DATEN erhalten, übersprungen", flush=True)
+            continue
+        if failed:
+            print(f"   {sym}: {failed} Dateien nicht geladen (Lücken)", flush=True)
         m1 = pd.concat(parts).sort_values("time").drop_duplicates("time").set_index("time")
         for tf, rule in (("15m", "15min"), ("1h", "1h")):
             bars = m1.resample(rule, label="left", closed="left").agg(
                 {"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
             bars.reset_index().to_csv(os.path.join(folder, f"{sym}_{tf}.csv"), index=False)
-        print(f"{sym}: {len(m1)} Minuten-Kerzen, letzter Kurs {m1['close'].iloc[-1]:.5g}")
+        print(f"{sym}: fertig, {len(m1)} Minuten-Kerzen ({time.time()-t0:.0f}s)", flush=True)
 
 
 def load_csv(path):
@@ -440,6 +464,7 @@ def main():
             print(f"Übersprungen (Name SYMBOL_TF erwartet): {name}")
             continue
         sym, tf = name.rsplit("_", 1)
+        print(f"Teste {sym} {tf} ...", flush=True)
         df = load_csv(f)
         step = df["time"].diff().median()
         maxhold = max(1, int(pd.Timedelta(hours=MAX_HOLD_HOURS) / step))
