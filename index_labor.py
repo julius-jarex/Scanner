@@ -87,11 +87,9 @@ def load_days(cfg):
     if not mats:
         return [], None
     M = np.stack(mats)
-    med = np.nanmedian(M[:, :, 3])
-    for div in (1000, 100, 10, 1, 10000, 100000):
-        if 1000 <= med / div <= 100000:
-            M = M / div
-            break
+    # Nasdaq-Daten aus dem ORB-Labor sind Rohwerte (x1000), Dukascopy-Daten schon umgerechnet
+    if cfg["kind"] == "orb" and np.nanmedian(M[:, :, 3]) > 500000:
+        M = M / 1000
     return days, M
 
 
