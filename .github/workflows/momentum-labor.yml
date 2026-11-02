@@ -1,0 +1,60 @@
+name: Momentum Nasdaq Labor
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Pakete installieren
+        run: pip install numpy pandas
+
+      # Nasdaq-Daten aus dem ORB-Labor
+      - uses: actions/cache/restore@v4
+        with:
+          path: daten
+          key: orb-daten-${{ github.run_id }}
+          restore-keys: orb-daten-
+
+      # S&P-500-Daten aus dem Range-Labor (falls schon geladen)
+      - uses: actions/cache/restore@v4
+        with:
+          path: daten/duka/USA500IDXUSD
+          key: duka-USA500IDXUSD-${{ github.run_id }}
+          restore-keys: duka-USA500IDXUSD-
+
+      - name: Backtest laufen lassen
+        run: |
+          python -u momentum_nasdaq_labor.py | tee ergebnis.txt
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat ergebnis.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Ergebnis per Telegram senden
+        if: always()
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TOKEN" ] || [ -z "$CHAT" ]; then echo "Telegram-Secrets fehlen"; exit 0; fi
+          [ -f ergebnis.txt ] || echo "Lauf abgebrochen, kein Ergebnis." > ergebnis.txt
+          KURZ=$(grep -E "^ERGEBNIS" ergebnis.txt | head -c 3000)
+          curl -s -X POST "https://api.telegram.org/bot$TOKEN/sendMessage" \
+            --data-urlencode "chat_id=$CHAT" \
+            --data-urlencode "text=Momentum Nasdaq Labor fertig: ${KURZ:-siehe Datei}" > /dev/null
+          curl -s -F "chat_id=$CHAT" -F "document=@ergebnis.txt" \
+            "https://api.telegram.org/bot$TOKEN/sendDocument" > /dev/null
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ergebnis
+          path: ergebnis.txt
