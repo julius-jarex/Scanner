@@ -1,0 +1,106 @@
+name: Range Sweep MSS Labor
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # 1) Jeder Markt lädt seine Daten in einem eigenen Job, alle gleichzeitig
+  laden:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    strategy:
+      fail-fast: false
+      matrix:
+        sym: [XAUUSD, EURUSD, GBPUSD, USDJPY, USA500IDXUSD, DEUIDXEUR]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy pandas
+      - name: Gespeicherte Daten holen
+        uses: actions/cache@v4
+        with:
+          path: daten/duka/${{ matrix.sym }}
+          key: duka-${{ matrix.sym }}-${{ github.run_id }}
+          restore-keys: duka-${{ matrix.sym }}-
+      - name: Fehlende Tage laden
+        run: python -u range_sweep_mss_labor.py --laden ${{ matrix.sym }}
+
+  # 2) Backtest über alle Märkte
+  backtest:
+    needs: laden
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy pandas
+
+      - name: Nasdaq + Krypto aus Cache (gemeinsam mit ORB-Labor)
+        uses: actions/cache@v4
+        with:
+          path: daten
+          key: orb-daten-${{ github.run_id }}
+          restore-keys: orb-daten-
+      - uses: actions/cache/restore@v4
+        with:
+          path: daten/duka/XAUUSD
+          key: duka-XAUUSD-${{ github.run_id }}
+          restore-keys: duka-XAUUSD-
+      - uses: actions/cache/restore@v4
+        with:
+          path: daten/duka/EURUSD
+          key: duka-EURUSD-${{ github.run_id }}
+          restore-keys: duka-EURUSD-
+      - uses: actions/cache/restore@v4
+        with:
+          path: daten/duka/GBPUSD
+          key: duka-GBPUSD-${{ github.run_id }}
+          restore-keys: duka-GBPUSD-
+      - uses: actions/cache/restore@v4
+        with:
+          path: daten/duka/USDJPY
+          key: duka-USDJPY-${{ github.run_id }}
+          restore-keys: duka-USDJPY-
+      - uses: actions/cache/restore@v4
+        with:
+          path: daten/duka/USA500IDXUSD
+          key: duka-USA500IDXUSD-${{ github.run_id }}
+          restore-keys: duka-USA500IDXUSD-
+      - uses: actions/cache/restore@v4
+        with:
+          path: daten/duka/DEUIDXEUR
+          key: duka-DEUIDXEUR-${{ github.run_id }}
+          restore-keys: duka-DEUIDXEUR-
+
+      - name: Backtest laufen lassen
+        run: |
+          python -u range_sweep_mss_labor.py | tee ergebnis.txt
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat ergebnis.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Ergebnis per Telegram senden
+        if: always()
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TOKEN" ] || [ -z "$CHAT" ]; then echo "Telegram-Secrets fehlen"; exit 0; fi
+          [ -f ergebnis.txt ] || echo "Lauf abgebrochen, kein Ergebnis." > ergebnis.txt
+          KURZ=$(grep -E "^ERGEBNIS|Unvollständige" ergebnis.txt | head -c 3000)
+          curl -s -X POST "https://api.telegram.org/bot$TOKEN/sendMessage" \
+            --data-urlencode "chat_id=$CHAT" \
+            --data-urlencode "text=Range Sweep MSS Labor fertig: ${KURZ:-siehe Datei}" > /dev/null
+          curl -s -F "chat_id=$CHAT" -F "document=@ergebnis.txt" \
+            "https://api.telegram.org/bot$TOKEN/sendDocument" > /dev/null
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ergebnis
+          path: ergebnis.txt
