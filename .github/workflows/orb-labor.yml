@@ -1,0 +1,39 @@
+name: ORB Nasdaq Labor
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Pakete installieren
+        run: pip install numpy pandas
+
+      # Geladene Tage bleiben gespeichert, jeder Lauf lädt nur noch fehlende nach
+      - name: Kursdaten aus Cache holen
+        uses: actions/cache@v4
+        with:
+          path: daten
+          key: orb-daten-${{ github.run_id }}
+          restore-keys: orb-daten-
+
+      - name: Backtest laufen lassen
+        run: |
+          python -u orb_nasdaq_labor.py --kosten 1.5 | tee ergebnis.txt
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat ergebnis.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ergebnis
+          path: ergebnis.txt
