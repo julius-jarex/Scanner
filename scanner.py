@@ -832,8 +832,8 @@ def heartbeat(state, now, checked, errors, dry):
             mine = f"\n{stats_line(state, 'mine')}" if state.get("_stats_mine") else ""
             telegram(f"💚 Scanner läuft. Letzte 24h: {n} Meldung(en). Aktuell {checked} Märkte geprüft, {errors} Fehler, "
                      f"{len(state.get('_trades', []))} offene Meldung(en).\n{stats_line(state)}{mine}\n"
-                     + f"{demo_summary_line(state)}\n" +
-                     "Befehle: /status /bilanz /journal /demo /hilfe\n"
+                     + f"{demo_summary_line(state)}\n{meme_summary_line(state)}\n" +
+                     "Befehle: /status /bilanz /journal /demo /meme /hilfe\n"
                      "Bleibt diese Nachricht aus: GitHub → Actions prüfen (nach ~60 Tagen ohne Repo-Aktivität pausiert GitHub geplante Läufe).", dry)
             state["hb"] = time.time()
         except Exception as e:
@@ -923,6 +923,7 @@ def update_trades(state, frames, now, dry):
 # ---------------- Befehle und Buttons ----------------
 HELP = ("Befehle:\n/status – offene Meldungen mit aktuellem Stand\n/bilanz – Auswertung\n/journal – abgeschlossene Meldungen als CSV\n"
         "/demo – Demo-Signale: offene Positionen und Bilanz\n"
+        "/meme – Memecoin-Radar: Live-Test-Auswertung\n"
         "/rein <Nr> – Meldung als deinen Trade markieren\n/raus <Nr> – Meldung als nicht genommen markieren\n"
         "(Die Buttons unter jeder Meldung machen dasselbe.)\n"
         "Hinweis: Der Scanner liest Befehle nur bei jedem Lauf, die Antwort kommt also mit Verzögerung.")
@@ -1003,6 +1004,8 @@ def process_updates(state, frames, now, dry, updates=None):
                     telegram(status_text(state, frames), dry, chat=chat)
                 elif cmd == "/bilanz":
                     telegram(stats_text(state), dry, chat=chat)
+                elif cmd == "/meme":
+                    telegram(meme_stats_text(state), dry, chat=chat)
                 elif cmd == "/demo":
                     telegram(demo_text(state), dry, chat=chat)
                 elif cmd == "/journal":
@@ -1650,6 +1653,267 @@ def demo_run(state, now, dry, telegram, alert_error, env):
     return errors
 
 
+# ================= Memecoin-Radar (Base) – Spielgeld, NICHT getestet =================
+# Sucht alle 10 Minuten auf dem Netzwerk Base nach Memecoins mit plötzlichem Kauf-Andrang
+# und prüft jeden Kandidaten mit GoPlus auf typische Betrugsmerkmale (Honeypot, hohe Steuern ...).
+# Daten: GeckoTerminal und GoPlus, beide kostenlos und ohne Schlüssel.
+# Kein Backtest möglich (keine freien historischen DEX-Daten). Stattdessen Live-Test:
+# Der Bot misst den Kurs jedes Treffers nach 1 h, 6 h und 24 h und vergleicht mit einer
+# Zufallsgruppe anderer gefragter Pools (/meme). Abschalten: Variable MEME_RADAR=0.
+MEME_NETWORK, MEME_GOPLUS_CHAIN = "base", "8453"
+MEME_GT = "https://api.geckoterminal.com/api/v2"
+MEME_MIN_LIQ = 40_000          # Liquidität im Pool (USD)
+MEME_MIN_MCAP = 150_000        # Marktwert bzw. FDV (USD)
+MEME_MIN_AGE_H = 2             # frisch gestartete Pools (höchstes Rug-Risiko) auslassen
+MEME_MIN_VOL_H1 = 30_000       # Volumen der letzten Stunde (USD)
+MEME_VOL_ACCEL = 2.0           # Volumen 1 h mindestens 2x so hoch wie der Stundenschnitt der letzten 6 h
+MEME_CHG_H1 = (5.0, 80.0)      # Kurs 1 h: steigend, aber noch nicht senkrecht
+MEME_MIN_M5 = -5.0             # letzte 5 Min. nicht im Absturz
+MEME_BUYER_RATIO = 1.3         # mehr verschiedene Käufer als Verkäufer
+MEME_MIN_BUYERS = 50
+MEME_MAX_TAX = 0.10            # Kauf-/Verkaufssteuer höchstens 10 %
+MEME_TOP_HOLDER = 0.15         # Warnung, wenn eine einzelne Wallet mehr als 15 % hält
+MEME_MAX_PER_RUN = 3
+MEME_COOLDOWN_H = 24
+MEME_CHECKS_H = (1, 6, 24)
+MEME_SKIP = {"WETH", "ETH", "USDC", "USDT", "DAI", "CBBTC", "WBTC", "CBETH", "WSTETH", "EURC", "USDBC", "AERO"}
+
+
+def meme_get(url, params=None):
+    r = requests.get(url, params=params, timeout=20, headers={"Accept": "application/json"})
+    r.raise_for_status()
+    time.sleep(2.2)                     # GeckoTerminal: ca. 30 Abrufe pro Minute
+    return r.json()
+
+
+def meme_num(x, default=0.0):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
+
+def meme_pools(now):
+    """Gefragte und neue Pools auf Base -> Liste flacher Dicts."""
+    out, seen = [], set()
+    for path in ("trending_pools", "new_pools"):
+        js = meme_get(f"{MEME_GT}/networks/{MEME_NETWORK}/{path}", {"page": 1})
+        for p in js.get("data", []):
+            a = p.get("attributes", {})
+            tok = (((p.get("relationships") or {}).get("base_token") or {}).get("data") or {}).get("id", "")
+            addr = tok.split("_", 1)[1].lower() if "_" in tok else ""
+            name = a.get("name") or ""
+            sym = name.split("/")[0].strip()
+            if not addr or addr in seen:
+                continue
+            seen.add(addr)
+            tx = (a.get("transactions") or {}).get("h1") or {}
+            vol = a.get("volume_usd") or {}
+            chg = a.get("price_change_percentage") or {}
+            created = pd.to_datetime(a.get("pool_created_at"), utc=True, errors="coerce")
+            out.append({"addr": addr, "pool": a.get("address", ""), "name": name, "sym": sym,
+                        "price": meme_num(a.get("base_token_price_usd")),
+                        "liq": meme_num(a.get("reserve_in_usd")),
+                        "mcap": meme_num(a.get("market_cap_usd")) or meme_num(a.get("fdv_usd")),
+                        "vol_h1": meme_num(vol.get("h1")), "vol_h6": meme_num(vol.get("h6")),
+                        "chg_m5": meme_num(chg.get("m5")), "chg_h1": meme_num(chg.get("h1")),
+                        "chg_h6": meme_num(chg.get("h6")), "chg_h24": meme_num(chg.get("h24")),
+                        "buyers": int(meme_num(tx.get("buyers"))), "sellers": int(meme_num(tx.get("sellers"))),
+                        "buys": int(meme_num(tx.get("buys"))), "sells": int(meme_num(tx.get("sells"))),
+                        "age_h": (pd.Timestamp(now) - created).total_seconds() / 3600 if pd.notna(created) else 0.0})
+    return out
+
+
+def meme_basic_ok(p):
+    return (p["sym"].upper() not in MEME_SKIP and p["price"] > 0 and p["liq"] >= MEME_MIN_LIQ
+            and p["mcap"] >= MEME_MIN_MCAP and p["age_h"] >= MEME_MIN_AGE_H)
+
+
+def meme_signal(p):
+    """Gibt (ok, Gründe) zurück."""
+    accel = p["vol_h1"] / (p["vol_h6"] / 6) if p["vol_h6"] > 0 else 0.0
+    p["accel"] = accel
+    checks = [(meme_basic_ok(p), "Grundfilter"),
+              (p["vol_h1"] >= MEME_MIN_VOL_H1, "Volumen 1 h"),
+              (accel >= MEME_VOL_ACCEL, "Volumen-Beschleunigung"),
+              (MEME_CHG_H1[0] <= p["chg_h1"] <= MEME_CHG_H1[1], "Kurs 1 h"),
+              (p["chg_m5"] >= MEME_MIN_M5, "Kurs 5 Min."),
+              (p["buyers"] >= MEME_MIN_BUYERS and p["buyers"] >= MEME_BUYER_RATIO * max(p["sellers"], 1), "Käufer/Verkäufer")]
+    return all(c for c, _ in checks), [n for c, n in checks if not c]
+
+
+def meme_security(addr):
+    """GoPlus-Check. (ok, Punkte, Warnungen). Ohne Ergebnis -> nicht ok (Sicherheit zuerst)."""
+    r = requests.get(f"https://api.gopluslabs.io/api/v1/token_security/{MEME_GOPLUS_CHAIN}",
+                     params={"contract_addresses": addr}, timeout=20)
+    r.raise_for_status()
+    time.sleep(2.0)
+    res = (r.json().get("result") or {})
+    s = res.get(addr) or res.get(addr.lower()) or next(iter(res.values()), None)
+    if not s:
+        return False, [], ["GoPlus kennt den Token (noch) nicht"]
+    flag = lambda k: str(s.get(k, "0")) == "1"
+    bt, st_ = meme_num(s.get("buy_tax")), meme_num(s.get("sell_tax"))
+    bad = []
+    if flag("is_honeypot"): bad.append("Honeypot (Verkauf blockiert)")
+    if flag("cannot_sell_all"): bad.append("nicht alles verkaufbar")
+    if flag("hidden_owner"): bad.append("versteckter Besitzer")
+    if flag("owner_change_balance"): bad.append("Besitzer kann Guthaben ändern")
+    if flag("transfer_pausable"): bad.append("Handel kann gestoppt werden")
+    if flag("is_blacklisted"): bad.append("Sperrliste im Vertrag")
+    if str(s.get("is_open_source", "0")) != "1": bad.append("Vertrag nicht offengelegt")
+    if bt > MEME_MAX_TAX or st_ > MEME_MAX_TAX: bad.append(f"Steuer zu hoch ({bt:.0%}/{st_:.0%})")
+    good = [f"kein Honeypot, Steuer {bt:.0%} Kauf / {st_:.0%} Verkauf, Vertrag offen"]
+    warn = []
+    if flag("is_mintable"): warn.append("neue Token können erzeugt werden (mintbar)")
+    if flag("slippage_modifiable"): warn.append("Steuer nachträglich änderbar")
+    top = 0.0
+    for h in s.get("holders") or []:
+        if str(h.get("is_locked", 0)) in ("1", "True", "true") or str(h.get("is_contract", 0)) in ("1", "True", "true"):
+            continue
+        top = max(top, meme_num(h.get("percent")))
+    if top > MEME_TOP_HOLDER: warn.append(f"eine Wallet hält {top:.0%}")
+    hc = s.get("holder_count")
+    if hc: good.append(f"{int(meme_num(hc))} Halter")
+    return not bad, good, bad + warn if bad else warn
+
+
+def meme_prices(addrs):
+    out = {}
+    for i in range(0, len(addrs), 30):
+        chunk = addrs[i:i + 30]
+        js = meme_get(f"{MEME_GT}/simple/networks/{MEME_NETWORK}/token_price/{','.join(chunk)}")
+        tp = ((js.get("data") or {}).get("attributes") or {}).get("token_prices") or {}
+        out.update({k.lower(): meme_num(v, None) for k, v in tp.items()})
+    return out
+
+
+def meme_st(state):
+    d = state.setdefault("_meme", {})
+    for k, v in (("track", []), ("sent", {})):
+        d.setdefault(k, v)
+    return d
+
+
+def meme_fmt_usd(x):
+    return f"{x / 1e6:.2f} Mio. $" if x >= 1e6 else f"{x / 1e3:.0f} Tsd. $"
+
+
+def meme_msg(p, good, warn):
+    w = ("\n⚠️ " + "; ".join(warn)) if warn else ""
+    return (f"🎰 MEMECOIN-RADAR (Base) | Spielgeld, NICHT getestet\n{p['sym']} ({p['name']})\n\n"
+            f"Kurs: {p['price']:.8g} $ | Marktwert: {meme_fmt_usd(p['mcap'])} | Liquidität: {meme_fmt_usd(p['liq'])}\n"
+            f"Kurs: 1 h {p['chg_h1']:+.0f} %, 6 h {p['chg_h6']:+.0f} %, 24 h {p['chg_h24']:+.0f} % | Alter {p['age_h']:.0f} h\n"
+            f"Volumen 1 h: {meme_fmt_usd(p['vol_h1'])} ({p['accel']:.1f}x so viel wie üblich)\n"
+            f"Käufer/Verkäufer 1 h: {p['buyers']}/{p['sellers']}\n\n"
+            f"Sicherheit (GoPlus): ✅ {'; '.join(good)}{w}\n\n"
+            f"Contract: {p['addr']}\n"
+            f"https://dexscreener.com/base/{p['pool']}\nhttps://www.geckoterminal.com/base/pools/{p['pool']}\n\n"
+            "Wichtig: Die meisten Memecoins fallen stark oder auf null. Nur Spielgeld (z. B. max. 10 €). In Coinbase Wallet "
+            "den Token NUR über die Contract-Adresse oben suchen (Fälschungen mit gleichem Namen sind häufig), Netzwerk Base, "
+            "Slippage niedrig halten. GoPlus erkennt nicht jeden Betrug. Der Bot misst nach 1 h, 6 h und 24 h, "
+            "wie es weiterging (/meme).")
+
+
+def meme_stats_text(state):
+    d = meme_st(state)
+    out = ["🎰 Memecoin-Radar: Live-Test (Kursänderung nach dem Treffer, ohne Gebühren)"]
+    for grp, label in (("signal", "Radar-Treffer"), ("zufall", "Vergleich: zufällige andere Pools")):
+        rows = [t for t in d["track"] if t["grp"] == grp]
+        out.append(f"\n{label}: {len(rows)}")
+        for h in MEME_CHECKS_H:
+            v = [t["r"][str(h)] for t in rows if str(h) in t["r"]]
+            if v:
+                v = np.array(v)
+                out.append(f"  nach {h} h (n={len(v)}): Median {np.median(v):+.0f} %, Ø {v.mean():+.0f} %, "
+                           f"≥ +50 %: {(v >= 50).mean():.0%}, ≤ -50 %: {(v <= -50).mean():.0%}")
+    out.append("\nAussagekräftig erst nach etwa 50-100 Treffern. Nur wenn die Treffer klar besser abschneiden als der "
+               "Vergleich, hat der Radar einen Vorsprung. Swap-Gebühren und Slippage (oft 1-3 %) kommen noch dazu.")
+    return "\n".join(out)
+
+
+def meme_summary_line(state):
+    d = state.get("_meme")
+    rows = [t for t in (d or {}).get("track", []) if t["grp"] == "signal" and "24" in t["r"]]
+    if not rows:
+        return "Memecoin-Radar: noch keine 24-h-Auswertung."
+    v = np.array([t["r"]["24"] for t in rows])
+    return f"Memecoin-Radar: {len(v)} Treffer ausgewertet, nach 24 h Median {np.median(v):+.0f} %"
+
+
+def meme_run(state, now, dry):
+    """Gibt die Anzahl Fehler zurück."""
+    if str(env("MEME_RADAR", "1")) == "0":
+        return 0
+    d = meme_st(state)
+    errors = 0
+    # 1) Laufende Messungen aktualisieren
+    due = [t for t in d["track"] if any(str(h) not in t["r"] and now.timestamp() - t["t0"] >= h * 3600
+                                        for h in MEME_CHECKS_H)]
+    if due:
+        try:
+            px = meme_prices(sorted({t["addr"] for t in due}))
+            for t in due:
+                for h in MEME_CHECKS_H:
+                    if str(h) not in t["r"] and now.timestamp() - t["t0"] >= h * 3600:
+                        p = px.get(t["addr"])
+                        if p:
+                            t["r"][str(h)] = round((p / t["p0"] - 1) * 100, 1)
+                        elif now.timestamp() - t["t0"] >= h * 3600 + 6 * 3600:
+                            t["r"][str(h)] = -100.0          # dauerhaft kein Kurs mehr -> als Totalverlust werten
+        except Exception as e:
+            errors += 1
+            print(f"[Meme] Kursabfrage fehlgeschlagen: {scrub(e)}")
+    sig = [t for t in d["track"] if t["grp"] == "signal"][-400:]
+    rnd = [t for t in d["track"] if t["grp"] == "zufall"][-400:]
+    d["track"] = sorted(sig + rnd, key=lambda t: t["t0"])
+    # 2) Neue Kandidaten suchen
+    try:
+        pools = meme_pools(now)
+    except Exception as e:
+        print(f"[Meme] GeckoTerminal nicht erreichbar: {scrub(e)}")
+        alert_error(state, "meme-gt", f"Memecoin-Radar: GeckoTerminal nicht erreichbar ({scrub(e)[:120]})", dry)
+        return errors + 1
+    cands = []
+    for p in pools:
+        ok, why = meme_signal(p)
+        if ok and now.timestamp() - d["sent"].get(p["addr"], 0) > MEME_COOLDOWN_H * 3600:
+            cands.append(p)
+    cands.sort(key=lambda p: -(p["accel"] * p["buyers"] / max(p["sellers"], 1)))
+    sent = 0
+    for p in cands:
+        if sent >= MEME_MAX_PER_RUN:
+            break
+        try:
+            ok, good, warn = meme_security(p["addr"])
+        except Exception as e:
+            print(f"[Meme] GoPlus-Fehler bei {p['sym']}: {scrub(e)}")
+            continue
+        if not ok:
+            print(f"[Meme] {p['sym']} aussortiert: {'; '.join(warn)}")
+            d["sent"][p["addr"]] = now.timestamp()          # nicht jede 10 Min. erneut prüfen
+            continue
+        try:
+            telegram(meme_msg(p, good, warn), dry)
+        except Exception as e:
+            print(f"[Meme] Meldung fehlgeschlagen: {scrub(e)}")
+            continue
+        d["sent"][p["addr"]] = now.timestamp()
+        d["track"].append({"grp": "signal", "addr": p["addr"], "sym": p["sym"], "p0": p["price"],
+                           "t0": now.timestamp(), "r": {}})
+        sent += 1
+    # 3) Vergleichsgruppe: ein zufälliger anderer Pool, der nur den Grundfilter erfüllt
+    others = [p for p in pools if meme_basic_ok(p) and p["addr"] not in d["sent"]]
+    last_rnd = max([t["t0"] for t in d["track"] if t["grp"] == "zufall"] or [0])
+    if others and now.timestamp() - last_rnd >= 3600:        # höchstens einer pro Stunde
+        p = others[int(now.timestamp()) % len(others)]
+        d["track"].append({"grp": "zufall", "addr": p["addr"], "sym": p["sym"], "p0": p["price"],
+                           "t0": now.timestamp(), "r": {}})
+    d["sent"] = {k: v for k, v in d["sent"].items() if now.timestamp() - v < 7 * 86400}
+    print(f"[Meme] {len(pools)} Pools geprüft, {len(cands)} Kandidaten, {sent} gemeldet")
+    return errors
+
+
 # ---------------- Hauptprogramm ----------------
 def main():
     ap = argparse.ArgumentParser()
@@ -1731,6 +1995,12 @@ def main():
         errors += demo_run(state, now, a.dry, telegram, alert_error, env)
     except Exception as e:
         print(f"Demo-Lauf fehlgeschlagen: {scrub(e)}")
+
+    # Memecoin-Radar (Base), rund um die Uhr, Spielgeld
+    try:
+        errors += meme_run(state, now, a.dry)
+    except Exception as e:
+        print(f"Memecoin-Radar fehlgeschlagen: {scrub(e)}")
 
     heartbeat(state, now, checked, errors, a.dry)
     save_state(state)
