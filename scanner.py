@@ -1320,6 +1320,25 @@ DEMO_EVIDENCE = {
                 "aber nicht sicher besser als Zufall (p=0,04). NICHT BESTANDEN, bester Kandidat."),
 }
 DEMO_HEAD = "🧪 DEMO-SIGNAL (nicht bestanden, nur Demokonto)"
+# Umrechnung ETF -> Index-CFD (Index ist etwa so viel Mal größer). Mit Variablen NDX_FAKTOR / SPX_FAKTOR anpassbar,
+# falls die CFD-Werte deines Brokers dauerhaft abweichen. Die Prozent-Abstände stimmen unabhängig davon.
+DEMO_INDEX = {"QQQ": ("Nasdaq-CFD", "NDX_FAKTOR", 41.2), "SPY": ("S&P-500-CFD", "SPX_FAKTOR", 10.0)}
+
+
+def demo_cfd(sym, entry, stop=None, target=None):
+    """Textblock mit den Werten für den Index-CFD (Indexpunkte)."""
+    name, var, default = DEMO_INDEX[sym]
+    try:
+        f = float(os.environ.get(var) or default)
+    except ValueError:
+        f = default
+    lines = [f"Für deinen {name} (umgerechnet, ca.):", f"Einstieg: ca. {entry * f:,.0f}".replace(",", ".")]
+    if stop is not None:
+        lines.append(f"Stop: ca. {stop * f:,.0f} ({abs(entry - stop) * f:,.0f} Punkte entfernt)".replace(",", "."))
+    if target is not None:
+        lines.append(f"Ziel: ca. {target * f:,.0f} ({abs(target - entry) * f:,.0f} Punkte entfernt)".replace(",", "."))
+    lines.append("Weicht dein CFD-Kurs beim Einstieg ab: Abstände in Punkten bzw. Prozent übernehmen, nicht die Preise.")
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------------------ Daten
@@ -1423,7 +1442,9 @@ def demo_orb(d, q, today, m_now, now, send):
             if stop_hit:
                 px = min(b.open, pos["stop"]) if pos["dir"] > 0 else max(b.open, pos["stop"])
                 g, n = demo_book(d, key, pos, px, "Stop", now)
-                send(f"🧪❌ DEMO ORB QQQ: Stop {pos['stop']} getroffen ({g:+.1f}R, nach Kosten {n:+.2f}R)")
+                cfd = f"{pos['stop'] * DEMO_INDEX['QQQ'][2]:,.0f}".replace(",", ".")
+                send(f"🧪❌ DEMO ORB QQQ: Stop {pos['stop']} getroffen (Nasdaq-CFD ca. {cfd}) "
+                     f"({g:+.1f}R, nach Kosten {n:+.2f}R)")
                 return
             if tgt_hit:
                 g, n = demo_book(d, key, pos, pos["target"], "Ziel 10R", now)
@@ -1464,8 +1485,7 @@ def demo_orb(d, q, today, m_now, now, send):
     send(f"{DEMO_HEAD}\nORB {side} Nasdaq 100 (QQQ) | erste 5 Min. {'grün' if di > 0 else 'rot'}\n\n"
          f"Einstieg: ca. {entry:.2f} (Marktpreis)\nStop: {stop:.2f} ({demo_pct(stop, entry)} entfernt)\n"
          f"Ziel 10R: {target:.2f} ({demo_pct(target, entry)} entfernt)\nSonst: Ausstieg um 16:00 New York\n\n"
-         f"Für Nasdaq-CFD oder MNQ: zum Marktpreis {'kaufen' if di > 0 else 'verkaufen'}, Stop {demo_pct(stop, entry)} "
-         f"{'unter' if di > 0 else 'über'} dem Einstieg, Ziel {demo_pct(target, entry)} entfernt.\n\n{DEMO_EVIDENCE['ORB']}\n"
+         f"{demo_cfd('QQQ', entry, stop, target)}\n\n{DEMO_EVIDENCE['ORB']}\n"
          "Nur Demo, keine Anlageberatung.")
 
 
@@ -1550,8 +1570,8 @@ def demo_momentum(d, q, today, m_now, now, send):
              f"Kein festes Ziel. Der Bot prüft alle 30 Min. (nächster Check "
              f"{(pd.Timestamp('2000-01-01 09:30') + timedelta(minutes=k + 30)).strftime('%H:%M')}) und meldet den Ausstieg; "
              "spätestens um 16:00 schließen.\n\n"
-             f"Für Nasdaq-CFD oder MNQ: zum Marktpreis {'kaufen' if di > 0 else 'verkaufen'}. Als Notbremse einen Stop "
-             f"{demo_pct(lvl, px)} entfernt setzen.\n\n{DEMO_EVIDENCE['MOMENTUM']}\nNur Demo, keine Anlageberatung.")
+             f"{demo_cfd('QQQ', px, lvl)}\n(Stop als Notbremse setzen; der eigentliche Ausstieg kommt vom Bot.)\n\n"
+             f"{DEMO_EVIDENCE['MOMENTUM']}\nNur Demo, keine Anlageberatung.")
 
 
 # ------------------------------------------------------------------ Mean Reversion
@@ -1596,8 +1616,7 @@ def demo_meanrev(d, sym, daily, px, today, now, send):
              f"RSI(2): {rsi:.0f} (unter {DEMO_MR_RSI_MAX:g}), Kurs über 200-Tage-Schnitt ({sma200:.2f})\n"
              f"Ausstieg: Der Bot meldet den Verkauf, sobald der Kurs über dem 5-Tage-Schnitt schließt, "
              f"spätestens nach {DEMO_MR_MAX_HOLD} Tagen. Kein Stop (wie im Test), 1R = ATR(10) = {atr:.2f} "
-             f"({demo_pct(px - atr, px)}).\n\nFür Index-CFD oder Micro-Future: gleicher Ablauf auf "
-             f"{'Nasdaq 100 / MNQ' if sym == 'QQQ' else 'S&P 500 / MES'}. Haltedauer meist 2-5 Tage, "
+             f"({demo_pct(px - atr, px)}).\n\n{demo_cfd(sym, px)}\nHaltedauer meist 2-5 Tage, "
              f"Übernachtkosten beachten.\n\n{DEMO_EVIDENCE['MEANREV']}\nNur Demo, keine Anlageberatung.")
 
 
