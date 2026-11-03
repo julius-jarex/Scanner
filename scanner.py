@@ -8,6 +8,7 @@ import requests
 import pandas as pd
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
+import numpy as np
 
 # ---------------- Einstellungen (hier anpassen) ----------------
 CRYPTO = {"BTCUSD": "XBTUSD"}          # Kraken-Paare (kostenlos, ohne Key)
@@ -831,7 +832,8 @@ def heartbeat(state, now, checked, errors, dry):
             mine = f"\n{stats_line(state, 'mine')}" if state.get("_stats_mine") else ""
             telegram(f"💚 Scanner läuft. Letzte 24h: {n} Meldung(en). Aktuell {checked} Märkte geprüft, {errors} Fehler, "
                      f"{len(state.get('_trades', []))} offene Meldung(en).\n{stats_line(state)}{mine}\n"
-                     "Befehle: /status /bilanz /journal /hilfe\n"
+                     + f"{demo_summary_line(state)}\n" +
+                     "Befehle: /status /bilanz /journal /demo /hilfe\n"
                      "Bleibt diese Nachricht aus: GitHub → Actions prüfen (nach ~60 Tagen ohne Repo-Aktivität pausiert GitHub geplante Läufe).", dry)
             state["hb"] = time.time()
         except Exception as e:
@@ -920,6 +922,7 @@ def update_trades(state, frames, now, dry):
 
 # ---------------- Befehle und Buttons ----------------
 HELP = ("Befehle:\n/status – offene Meldungen mit aktuellem Stand\n/bilanz – Auswertung\n/journal – abgeschlossene Meldungen als CSV\n"
+        "/demo – Demo-Signale: offene Positionen und Bilanz\n"
         "/rein <Nr> – Meldung als deinen Trade markieren\n/raus <Nr> – Meldung als nicht genommen markieren\n"
         "(Die Buttons unter jeder Meldung machen dasselbe.)\n"
         "Hinweis: Der Scanner liest Befehle nur bei jedem Lauf, die Antwort kommt also mit Verzögerung.")
@@ -1000,6 +1003,8 @@ def process_updates(state, frames, now, dry, updates=None):
                     telegram(status_text(state, frames), dry, chat=chat)
                 elif cmd == "/bilanz":
                     telegram(stats_text(state), dry, chat=chat)
+                elif cmd == "/demo":
+                    telegram(demo_text(state), dry, chat=chat)
                 elif cmd == "/journal":
                     data = journal_csv(state)
                     if data:
@@ -1282,6 +1287,369 @@ def swing_run(state, now, dry):
     return errors
 
 
+# ================= Demo-Signale (im Labor NICHT bestanden, nur Demokonto) =================
+# 
+try:
+    from zoneinfo import ZoneInfo
+    DEMO_NY = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover
+    DEMO_NY = "America/New_York"
+
+DEMO_COST_PCT = 0.00006          # Kosten je Trade (Kauf+Verkauf) in % vom Preis: ca. 1,5 Nasdaq-Punkte bzw. 0,5 S&P-Punkte
+DEMO_FINANCING = 0.05            # Übernachtfinanzierung p.a. (nur Mean Reversion)
+DEMO_ORB_TARGET_R = 10.0
+DEMO_ORB_LATEST_MIN = 30         # ORB-Signal nur bis 10:00 New York, danach verpasst
+DEMO_MOM_LOOKBACK = 14
+DEMO_MOM_CHECKS = list(range(30, 390, 30))   # Minuten nach 09:30 -> 10:00 ... 15:30
+DEMO_MOM_LATE_MIN = 20           # Prüfzeitpunkt höchstens so viele Minuten verspätet auswerten
+DEMO_MR_WINDOW = (360, 389)      # 15:30-15:59 New York
+DEMO_MR_RSI_MAX, DEMO_MR_MAX_HOLD = 25.0, 10
+DEMO_MIN_RISK_COST = 3.0
+DEMO_CHASE_R = 0.5
+DEMO_NAMES = {"QQQ": "Nasdaq 100 (QQQ)", "SPY": "S&P 500 (SPY)"}
+
+DEMO_EVIDENCE = {
+    "ORB": ("Labor: Nasdaq 2021-2026 +0,12R pro Trade (t=1,6), auf S&P 500, Dow und DAX nicht bestätigt "
+            "(alle zusammen +0,01R). DURCHGEFALLEN."),
+    "MOMENTUM": ("Labor: Nasdaq +0,19R pro Trade (t=1,2), S&P 500 -0,14R, Dow -0,14R, DAX +0,05R "
+                 "(alle zusammen +0,02R). DURCHGEFALLEN."),
+    "MEANREV": ("Labor: Nasdaq +0,32R (t=2,7), S&P 500 +0,53R (t=4,3), 4 Indizes zusammen +0,28R (t=3,6), "
+                "aber nicht sicher besser als Zufall (p=0,04). NICHT BESTANDEN, bester Kandidat."),
+}
+DEMO_HEAD = "🧪 DEMO-SIGNAL (nicht bestanden, nur Demokonto)"
+
+
+# ------------------------------------------------------------------ Daten
+def demo_fetch(symbol, interval, n, key, now):
+    r = requests.get("https://api.twelvedata.com/time_series", params={
+        "symbol": symbol, "interval": interval, "outputsize": n, "timezone": "UTC", "apikey": key}, timeout=30)
+    j = r.json()
+    if j.get("status") == "error":
+        raise RuntimeError(j.get("message"))
+    df = pd.DataFrame(j["values"])
+    df["time"] = pd.to_datetime(df["datetime"], utc=True)
+    for c in ("open", "high", "low", "close"):
+        df[c] = df[c].astype(float)
+    df["volume"] = pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0.0)
+    df = df.sort_values("time").reset_index(drop=True)
+    if interval.endswith("min"):
+        step = pd.Timedelta(minutes=int(interval[:-3]))
+        df = df[df.time + step <= pd.Timestamp(now)]          # nur abgeschlossene Kerzen
+    return df.reset_index(drop=True)
+
+
+def demo_session(df):
+    """Fügt New-York-Datum und Minute seit 09:30 hinzu, nur reguläre Handelszeit."""
+    t = df.time.dt.tz_convert(DEMO_NY)
+    df = df.assign(day=t.dt.date, m=(t.dt.hour * 60 + t.dt.minute - 570).astype(int))
+    return df[(df.m >= 0) & (df.m < 390)].reset_index(drop=True)
+
+
+def demo_ny_now(now):
+    t = pd.Timestamp(now).tz_convert(DEMO_NY)
+    return t.date(), t.hour * 60 + t.minute - 570, t.weekday()
+
+
+# ------------------------------------------------------------------ Buchführung
+def demo_st(state):
+    d = state.setdefault("_demo", {})
+    for k, v in (("open", {}), ("stats", {}), ("journal", []), ("done", {})):
+        d.setdefault(k, v)
+    return d
+
+
+def demo_book(d, key, pos, exit_px, why, now, extra_cost=0.0):
+    risk = pos["risk"]
+    gross = pos["dir"] * (exit_px - pos["entry"]) / risk
+    net = gross - (DEMO_COST_PCT * pos["entry"] + extra_cost) / risk
+    s = d["stats"].setdefault(pos["strat"], {"n": 0, "win": 0, "r": 0.0})
+    s["n"] += 1
+    s["win"] += 1 if net > 0 else 0
+    s["r"] = round(s["r"] + net, 3)
+    d["journal"].append({"closed": pd.Timestamp(now).strftime("%Y-%m-%d %H:%M"), "strategie": pos["strat"],
+                         "symbol": pos["sym"], "richtung": "long" if pos["dir"] > 0 else "short",
+                         "einstieg": pos["entry"], "ausstieg": round(exit_px, 4), "grund": why,
+                         "r": round(gross, 2), "r_netto": round(net, 2)})
+    del d["journal"][:-300]
+    d["open"].pop(key, None)
+    return gross, net
+
+
+def demo_summary_line(state):
+    d = state.get("_demo")
+    if not d or not d.get("stats"):
+        return "Demo-Signale: noch nichts abgeschlossen."
+    parts = [f"{k} {v['n']}x {v['r']:+.1f}R" for k, v in d["stats"].items()]
+    return "Demo-Signale (nach Kosten): " + ", ".join(parts)
+
+
+def demo_text(state):
+    d = demo_st(state)
+    out = ["🧪 Demo-Signale (nicht bestanden, Live-Test)"]
+    if d["stats"]:
+        for k, v in d["stats"].items():
+            q = v["win"] / v["n"] * 100 if v["n"] else 0
+            out.append(f"{k}: {v['n']} Trades, Quote {q:.0f} %, Summe {v['r']:+.1f}R, Ø {v['r'] / max(v['n'], 1):+.2f}R")
+    else:
+        out.append("Noch keine abgeschlossenen Demo-Trades.")
+    if d["open"]:
+        out.append("Offen:")
+        for p in d["open"].values():
+            out.append(f"  {p['strat']} {p['sym']} {'LONG' if p['dir'] > 0 else 'SHORT'} seit {p['t0']}, "
+                       f"Einstieg {p['entry']}, Stop {p.get('stop', '-')}")
+    out.append("Zum Vergleich mit dem Labor: ORB +0,12R, Momentum +0,19R, Mean Reversion +0,3 bis +0,5R pro Trade "
+               "(jeweils Nasdaq/S&P). Aussagekräftig erst nach etwa 50-100 Trades je Strategie.")
+    return "\n".join(out)
+
+
+def demo_pct(a, b):
+    return f"{abs(a - b) / b * 100:.2f} %"
+
+
+# ------------------------------------------------------------------ ORB
+def demo_orb(d, q, today, m_now, now, send):
+    key = "ORB|QQQ"
+    t = q[q.day == today]
+    pos = d["open"].get(key)
+    if pos:                                   # offene Position verfolgen (Kerzen ihres Handelstags)
+        tp = q[q.day.astype(str) == pos["day"]]
+        for _, b in tp[tp.time > pd.Timestamp(pos["last"])].iterrows():
+            stop_hit = b.low <= pos["stop"] if pos["dir"] > 0 else b.high >= pos["stop"]
+            tgt_hit = b.high >= pos["target"] if pos["dir"] > 0 else b.low <= pos["target"]
+            pos["last"] = b.time.isoformat()
+            if stop_hit:
+                px = min(b.open, pos["stop"]) if pos["dir"] > 0 else max(b.open, pos["stop"])
+                g, n = demo_book(d, key, pos, px, "Stop", now)
+                send(f"🧪❌ DEMO ORB QQQ: Stop {pos['stop']} getroffen ({g:+.1f}R, nach Kosten {n:+.2f}R)")
+                return
+            if tgt_hit:
+                g, n = demo_book(d, key, pos, pos["target"], "Ziel 10R", now)
+                send(f"🧪✅ DEMO ORB QQQ: Ziel 10R {pos['target']} erreicht ({g:+.1f}R, nach Kosten {n:+.2f}R)")
+                return
+            if b.m >= 385:
+                g, n = demo_book(d, key, pos, b.close, "Handelsschluss", now)
+                send(f"🧪⏱ DEMO ORB QQQ: zum Handelsschluss geschlossen bei {b.close} ({g:+.1f}R, nach Kosten {n:+.2f}R). "
+                     "Position jetzt schließen, falls noch offen.")
+                return
+        if pos["day"] != str(today):                          # Vortag ohne Abschluss -> letzter Kurs des Tages
+            px = float(tp.close.iloc[-1]) if not tp.empty else pos["entry"]
+            g, n = demo_book(d, key, pos, px, "Handelsschluss (nachträglich)", now)
+            send(f"🧪⏱ DEMO ORB QQQ vom {pos['day']}: nachträglich zum Schluss abgerechnet ({g:+.1f}R, nach Kosten {n:+.2f}R).")
+        return
+    if d["done"].get("ORB") == str(today) or t.empty or t.m.iloc[0] != 0:
+        return
+    d["done"]["ORB"] = str(today)
+    if m_now > DEMO_ORB_LATEST_MIN:
+        print("Demo ORB: Signalzeit verpasst (Lauf zu spät)")
+        return
+    f = t.iloc[0]
+    if f.close == f.open:
+        return
+    di = 1 if f.close > f.open else -1
+    stop = f.low if di > 0 else f.high
+    entry = float(t.close.iloc[-1])
+    risk0 = di * (f.close - stop)
+    risk = di * (entry - stop)
+    if risk0 <= 0 or risk <= 0 or di * (entry - f.close) > DEMO_CHASE_R * risk0 or risk < DEMO_MIN_RISK_COST * DEMO_COST_PCT * entry:
+        print("Demo ORB: kein gültiger Einstieg mehr (Stop zu nah, schon getroffen oder Preis davongelaufen)")
+        return
+    target = round(entry + di * DEMO_ORB_TARGET_R * risk, 2)
+    d["open"][key] = {"strat": "ORB", "sym": "QQQ", "dir": di, "entry": round(entry, 2), "stop": round(stop, 2),
+                      "target": target, "risk": risk, "t0": f"{today} 09:35 NY", "last": t.time.iloc[-1].isoformat(),
+                      "day": str(today)}
+    side = "LONG 🟢" if di > 0 else "SHORT 🔴"
+    send(f"{DEMO_HEAD}\nORB {side} Nasdaq 100 (QQQ) | erste 5 Min. {'grün' if di > 0 else 'rot'}\n\n"
+         f"Einstieg: ca. {entry:.2f} (Marktpreis)\nStop: {stop:.2f} ({demo_pct(stop, entry)} entfernt)\n"
+         f"Ziel 10R: {target:.2f} ({demo_pct(target, entry)} entfernt)\nSonst: Ausstieg um 16:00 New York\n\n"
+         f"Für Nasdaq-CFD oder MNQ: zum Marktpreis {'kaufen' if di > 0 else 'verkaufen'}, Stop {demo_pct(stop, entry)} "
+         f"{'unter' if di > 0 else 'über'} dem Einstieg, Ziel {demo_pct(target, entry)} entfernt.\n\n{DEMO_EVIDENCE['ORB']}\n"
+         "Nur Demo, keine Anlageberatung.")
+
+
+# ------------------------------------------------------------------ Momentum
+def demo_momentum(d, q, today, m_now, now, send):
+    key = "MOM|QQQ"
+    days = sorted(q.day.unique())
+    if not days or days[-1] != today:
+        return
+    pos = d["open"].get(key)
+    t = q[q.day == today].set_index("m")
+    if pos and pos["day"] != str(today):                      # Vortag ohne Abschluss -> letzter Kurs des Tages
+        tp = q[q.day.astype(str) == pos["day"]]
+        px = float(tp.close.iloc[-1]) if not tp.empty else pos.get("last_px", pos["entry"])
+        g, n = demo_book(d, key, pos, px, "Handelsschluss (nachträglich)", now)
+        send(f"🧪⏱ DEMO MOMENTUM QQQ vom {pos['day']}: nachträglich zum Schluss abgerechnet ({g:+.1f}R, nach Kosten {n:+.2f}R).")
+        pos = None
+    if pos and m_now >= 390 and 385 in t.index:               # Handelsschluss
+        px = float(t.loc[385, "close"])
+        g, n = demo_book(d, key, pos, px, "Handelsschluss", now)
+        send(f"🧪⏱ DEMO MOMENTUM QQQ: zum Handelsschluss geschlossen bei {px:.2f} ({g:+.1f}R, nach Kosten {n:+.2f}R). "
+             "Position jetzt schließen, falls noch offen.")
+        return
+    due = [k for k in DEMO_MOM_CHECKS if k <= m_now and (k - 5) in t.index]
+    if not due:
+        return
+    k = due[-1]
+    done = d["done"].setdefault("MOM", {})
+    if done.get("day") != str(today):
+        done.clear()
+        done["day"] = str(today)
+    if str(k) in done:
+        return
+    done[str(k)] = True
+    if m_now - k > DEMO_MOM_LATE_MIN:
+        print(f"Demo Momentum: Prüfzeitpunkt {k} verpasst (Lauf zu spät)")
+        return
+    prior = [x for x in days if x < today][-(DEMO_MOM_LOOKBACK + 1):]
+    if len(prior) < DEMO_MOM_LOOKBACK + 1:
+        print("Demo Momentum: zu wenig Historie")
+        return
+    moves = []
+    for x in prior[1:]:
+        dx = q[q.day == x].set_index("m")
+        if 0 in dx.index and (k - 5) in dx.index:
+            moves.append(abs(dx.loc[k - 5, "close"] / dx.loc[0, "open"] - 1))
+    if len(moves) < DEMO_MOM_LOOKBACK - 3 or 0 not in t.index:
+        return
+    sigma = float(np.mean(moves))
+    op = float(t.loc[0, "open"])
+    pc = float(q[q.day == prior[-1]].close.iloc[-1])
+    ub, lb = max(op, pc) * (1 + sigma), min(op, pc) * (1 - sigma)
+    upto = t.loc[:k - 5]
+    tp = (upto.high + upto.low + upto.close) / 3
+    vwap = float((tp * upto.volume).sum() / upto.volume.sum()) if upto.volume.sum() > 0 else float(tp.mean())
+    px = float(t.loc[k - 5, "close"])
+    clock = (pd.Timestamp("2000-01-01 09:30") + timedelta(minutes=k)).strftime("%H:%M")
+    if pos:
+        pos["last_px"] = px
+        lvl = max(ub, vwap) if pos["dir"] > 0 else min(lb, vwap)
+        if (pos["dir"] > 0 and px < lvl) or (pos["dir"] < 0 and px > lvl):
+            g, n = demo_book(d, key, pos, px, f"Stop {clock}", now)
+            send(f"🧪❌ DEMO MOMENTUM QQQ: Ausstieg {clock} New York bei ca. {px:.2f} "
+                 f"(Kurs hinter Stop-Niveau {lvl:.2f}). Ergebnis {g:+.1f}R, nach Kosten {n:+.2f}R. Jetzt schließen.")
+            pos = None
+        else:
+            pos["stop"] = round(lvl, 2)
+            return
+    if pos is None and key not in d["open"]:
+        di = 1 if px > ub else -1 if px < lb else 0
+        if not di:
+            return
+        lvl = max(ub, vwap) if di > 0 else min(lb, vwap)
+        risk = di * (px - lvl)
+        if risk < DEMO_MIN_RISK_COST * DEMO_COST_PCT * px:
+            return
+        d["open"][key] = {"strat": "MOMENTUM", "sym": "QQQ", "dir": di, "entry": round(px, 2), "stop": round(lvl, 2),
+                          "risk": risk, "t0": f"{today} {clock} NY", "day": str(today), "last_px": px}
+        side = "LONG 🟢" if di > 0 else "SHORT 🔴"
+        send(f"{DEMO_HEAD}\nMOMENTUM {side} Nasdaq 100 (QQQ) | Ausbruch aus der Noise Area um {clock} New York\n\n"
+             f"Einstieg: ca. {px:.2f} (Marktpreis)\nStop-Niveau jetzt: {lvl:.2f} ({demo_pct(lvl, px)} entfernt)\n"
+             f"Kein festes Ziel. Der Bot prüft alle 30 Min. (nächster Check "
+             f"{(pd.Timestamp('2000-01-01 09:30') + timedelta(minutes=k + 30)).strftime('%H:%M')}) und meldet den Ausstieg; "
+             "spätestens um 16:00 schließen.\n\n"
+             f"Für Nasdaq-CFD oder MNQ: zum Marktpreis {'kaufen' if di > 0 else 'verkaufen'}. Als Notbremse einen Stop "
+             f"{demo_pct(lvl, px)} entfernt setzen.\n\n{DEMO_EVIDENCE['MOMENTUM']}\nNur Demo, keine Anlageberatung.")
+
+
+# ------------------------------------------------------------------ Mean Reversion
+def demo_meanrev(d, sym, daily, px, today, now, send):
+    key = f"MR|{sym}"
+    dd = daily[daily.time.dt.date < today].reset_index(drop=True)
+    if len(dd) < 210:
+        print(f"Demo Mean Reversion {sym}: zu wenig Tageskerzen ({len(dd)})")
+        return
+    closes = np.r_[dd.close.values, px]
+    sma200, sma5 = closes[-200:].mean(), closes[-5:].mean()
+    ch = np.diff(closes)
+    a = 0.5
+    up = dn = 0.0
+    for i, c in enumerate(ch):
+        if i == 0:
+            up, dn = max(c, 0), max(-c, 0)
+        else:
+            up = (1 - a) * up + a * max(c, 0)
+            dn = (1 - a) * dn + a * max(-c, 0)
+    rsi = 100.0 if dn == 0 else 100 - 100 / (1 + up / dn)
+    pc = dd.close.shift(1)
+    tr = pd.concat([dd.high - dd.low, (dd.high - pc).abs(), (dd.low - pc).abs()], axis=1).max(axis=1)
+    atr = float(tr.iloc[-10:].mean())
+    pos = d["open"].get(key)
+    name = DEMO_NAMES.get(sym, sym)
+    if pos:
+        held = int((dd.time.dt.date > pd.Timestamp(pos["day"]).date()).sum()) + 1
+        if px > sma5 or held >= DEMO_MR_MAX_HOLD:
+            nights = (pd.Timestamp(today) - pd.Timestamp(pos["day"])).days
+            fin = DEMO_FINANCING / 360 * pos["entry"] * nights
+            g, n = demo_book(d, key, pos, px, "über 5-Tage-Schnitt" if px > sma5 else "10 Tage", now, extra_cost=fin)
+            send(f"🧪 DEMO MEAN REVERSION {name}: VERKAUFEN jetzt (vor 16:00 New York), Kurs ca. {px:.2f} "
+                 f"({'über 5-Tage-Schnitt' if px > sma5 else 'nach 10 Tagen'}). Ergebnis {g:+.2f}R, "
+                 f"nach Kosten und Finanzierung {n:+.2f}R ({held} Tage gehalten).")
+        return
+    if px > sma200 and rsi < DEMO_MR_RSI_MAX:
+        d["open"][key] = {"strat": "MEANREV", "sym": sym, "dir": 1, "entry": round(px, 2), "risk": atr,
+                          "t0": f"{today} 15:30-16:00 NY", "day": str(today), "stop": "-"}
+        send(f"{DEMO_HEAD}\nMEAN REVERSION LONG 🟢 {name} | Rücksetzer im Aufwärtstrend\n\n"
+             f"Einstieg: ca. {px:.2f}, jetzt kaufen (vor 16:00 New York)\n"
+             f"RSI(2): {rsi:.0f} (unter {DEMO_MR_RSI_MAX:g}), Kurs über 200-Tage-Schnitt ({sma200:.2f})\n"
+             f"Ausstieg: Der Bot meldet den Verkauf, sobald der Kurs über dem 5-Tage-Schnitt schließt, "
+             f"spätestens nach {DEMO_MR_MAX_HOLD} Tagen. Kein Stop (wie im Test), 1R = ATR(10) = {atr:.2f} "
+             f"({demo_pct(px - atr, px)}).\n\nFür Index-CFD oder Micro-Future: gleicher Ablauf auf "
+             f"{'Nasdaq 100 / MNQ' if sym == 'QQQ' else 'S&P 500 / MES'}. Haltedauer meist 2-5 Tage, "
+             f"Übernachtkosten beachten.\n\n{DEMO_EVIDENCE['MEANREV']}\nNur Demo, keine Anlageberatung.")
+
+
+# ------------------------------------------------------------------ Hauptlauf
+def demo_run(state, now, dry, telegram, alert_error, env):
+    """Gibt die Anzahl Fehler zurück."""
+    if str(env("DEMO_SIGNALS", "1")) == "0" or not env("TWELVEDATA_KEY"):
+        return 0
+    today, m_now, wd = demo_ny_now(now)
+    if wd >= 5 or not (-5 <= m_now <= 450):
+        return 0
+    key = env("TWELVEDATA_KEY")
+    d = demo_st(state)
+
+    def send(msg):
+        try:
+            telegram(msg, dry)
+        except Exception as e:
+            print(f"Demo-Meldung fehlgeschlagen: {e}")
+
+    errors = 0
+    try:
+        time.sleep(8)                                    # Twelve Data: max. 8 Abrufe pro Minute
+        q = demo_session(demo_fetch("QQQ", "5min", 1500, key, now))
+        if not q.empty and q.day.iloc[-1] == today and 0 <= m_now < 390:
+            age = (pd.Timestamp(now) - q.time.iloc[-1]).total_seconds() / 60
+            if age > 20:
+                raise RuntimeError(f"QQQ-Daten {int(age)} Min. alt (verzögert?)")
+        demo_orb(d, q, today, m_now, now, send)
+        demo_momentum(d, q, today, m_now, now, send)
+    except Exception as e:
+        errors += 1
+        print(f"[Demo QQQ] Fehler: {e}")
+        alert_error(state, "demo-qqq", f"Demo-Signale QQQ: {str(e)[:150]}", dry)
+        q = None
+
+    if DEMO_MR_WINDOW[0] <= m_now <= DEMO_MR_WINDOW[1] and d["done"].get("MR") != str(today):
+        d["done"]["MR"] = str(today)
+        for sym in ("QQQ", "SPY"):
+            try:
+                time.sleep(8)
+                if sym == "QQQ" and q is not None and not q.empty:
+                    px = float(q.close.iloc[-1])
+                else:
+                    px = float(demo_fetch(sym, "5min", 5, key, now).close.iloc[-1])
+                    time.sleep(8)
+                daily = demo_fetch(sym, "1day", 260, key, now)
+                demo_meanrev(d, sym, daily, px, today, now, send)
+            except Exception as e:
+                errors += 1
+                print(f"[Demo Mean Reversion {sym}] Fehler: {e}")
+                alert_error(state, f"demo-mr-{sym}", f"Demo Mean Reversion {sym}: {str(e)[:150]}", dry)
+    return errors
+
+
 # ---------------- Hauptprogramm ----------------
 def main():
     ap = argparse.ArgumentParser()
@@ -1357,6 +1725,12 @@ def main():
             checked += len(SWING)
         except Exception as e:
             print(f"Swing-Lauf fehlgeschlagen: {scrub(e)}")
+
+    # Demo-Signale (ORB, Momentum, Mean Reversion auf Nasdaq/S&P 500), nur Demokonto
+    try:
+        errors += demo_run(state, now, a.dry, telegram, alert_error, env)
+    except Exception as e:
+        print(f"Demo-Lauf fehlgeschlagen: {scrub(e)}")
 
     heartbeat(state, now, checked, errors, a.dry)
     save_state(state)
