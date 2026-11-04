@@ -833,7 +833,7 @@ def heartbeat(state, now, checked, errors, dry):
             telegram(f"💚 Scanner läuft. Letzte 24h: {n} Meldung(en). Aktuell {checked} Märkte geprüft, {errors} Fehler, "
                      f"{len(state.get('_trades', []))} offene Meldung(en).\n{stats_line(state)}{mine}\n"
                      + f"{demo_summary_line(state)}\n{meme_summary_line(state)}\n" +
-                     "Befehle: /status /bilanz /journal /demo /meme /hilfe\n"
+                     "Befehle: /status /bilanz /journal /demo /meme /news /hilfe\n"
                      "Bleibt diese Nachricht aus: GitHub → Actions prüfen (nach ~60 Tagen ohne Repo-Aktivität pausiert GitHub geplante Läufe).", dry)
             state["hb"] = time.time()
         except Exception as e:
@@ -924,6 +924,7 @@ def update_trades(state, frames, now, dry):
 HELP = ("Befehle:\n/status – offene Meldungen mit aktuellem Stand\n/bilanz – Auswertung\n/journal – abgeschlossene Meldungen als CSV\n"
         "/demo – Demo-Signale: offene Positionen und Bilanz\n"
         "/meme – Memecoin-Radar: Live-Test-Auswertung\n"
+        "/news – wichtige Termine heute (kommt auch jeden Werktag um 07:00)\n"
         "/rein <Nr> – Meldung als deinen Trade markieren\n/raus <Nr> – Meldung als nicht genommen markieren\n"
         "(Die Buttons unter jeder Meldung machen dasselbe.)\n"
         "Hinweis: Der Scanner liest Befehle nur bei jedem Lauf, die Antwort kommt also mit Verzögerung.")
@@ -1004,6 +1005,8 @@ def process_updates(state, frames, now, dry, updates=None):
                     telegram(status_text(state, frames), dry, chat=chat)
                 elif cmd == "/bilanz":
                     telegram(stats_text(state), dry, chat=chat)
+                elif cmd in ("/news", "/termine"):
+                    brief_send(brief_text(now), dry, chat=chat)
                 elif cmd == "/meme":
                     telegram(meme_stats_text(state), dry, chat=chat)
                 elif cmd == "/demo":
@@ -1933,6 +1936,189 @@ def meme_run(state, now, dry):
     return errors
 
 
+# ================= Morgen-Briefing: High-Impact-Termine des Tages =================
+# Einmal pro Werktag ab 07:00 deutscher Zeit (und jederzeit mit /news): alle wichtigen Termine
+# des Tages mit Uhrzeit (deutsche Zeit), betroffenen Märkten und Zeitfenstern, in denen man besser
+# nicht handelt. Quelle: kostenloser Wochenkalender (CAL_URL). Abschalten: Variable MORNING_BRIEF=0.
+BRIEF_HOUR_LOCAL = 7
+BRIEF_TZ = "Europe/Berlin"
+BRIEF_FLAG = {"USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "JPY": "🇯🇵", "CAD": "🇨🇦", "AUD": "🇦🇺", "NZD": "🇳🇿",
+              "CHF": "🇨🇭", "CNY": "🇨🇳"}
+BRIEF_MARKETS = {
+    "USD": "Nasdaq, S&P 500, Dow, Gold, alle USD-Paare (EURUSD, GBPUSD, USDJPY …), auch Krypto",
+    "EUR": "DAX, EURUSD und andere EUR-Paare",
+    "GBP": "GBPUSD und andere GBP-Paare, FTSE",
+    "JPY": "USDJPY und andere JPY-Paare, Nikkei",
+    "CAD": "USDCAD, Öl",
+    "AUD": "AUDUSD, etwas Gold",
+    "NZD": "NZDUSD",
+    "CHF": "USDCHF, EURCHF, etwas Gold",
+    "CNY": "AUDUSD, Öl, Rohstoffe, etwas Gold",
+}
+
+
+# Typische Marktreaktion je Termin-Art (Lehrbuch, nicht garantiert)
+BRIEF_KIND = [
+    ("inverse", ["unemployment rate", "unemployment claims", "jobless", "claimant count"]),
+    ("inflation", ["cpi", "ppi", "pce", "inflation", "price index", "hicp", "average hourly earnings",
+                   "average earnings", "employment cost", "wage"]),
+    ("policy", ["rate decision", "interest rate", "fomc", "federal funds", "statement", "press conference", "minutes",
+                "speaks", "testifies", "monetary policy", "cash rate", "overnight rate", "official bank rate", "refinancing rate"]),
+    ("growth", ["employment", "payroll", "non-farm", "retail sales", "gdp", "pmi", "ism", "durable", "jolts",
+                "job openings", "confidence", "sentiment", "industrial production", "manufacturing", "services"]),
+]
+# Wirkung, wenn die Währung STÄRKER wird
+BRIEF_CCY_UP = {
+    "USD": "Dollar ↑ → EURUSD/GBPUSD SHORT, USDJPY LONG, Gold SHORT, Nasdaq/S&P eher SHORT, Krypto eher SHORT",
+    "EUR": "Euro ↑ → EURUSD LONG; DAX uneinheitlich (oft leicht schwächer)",
+    "GBP": "Pfund ↑ → GBPUSD LONG",
+    "JPY": "Yen ↑ → USDJPY SHORT; Nikkei eher schwächer",
+    "CAD": "CAD ↑ → USDCAD SHORT",
+    "AUD": "AUD ↑ → AUDUSD LONG",
+    "NZD": "NZD ↑ → NZDUSD LONG",
+    "CHF": "Franken ↑ → USDCHF SHORT",
+    "CNY": "gute China-Daten → AUDUSD LONG, Rohstoffe/Öl eher LONG",
+}
+BRIEF_CCY_DOWN = {
+    "USD": "Dollar ↓ → EURUSD/GBPUSD LONG, USDJPY SHORT, Gold LONG, Nasdaq/S&P eher LONG, Krypto eher LONG",
+    "EUR": "Euro ↓ → EURUSD SHORT; DAX uneinheitlich (oft leicht stärker)",
+    "GBP": "Pfund ↓ → GBPUSD SHORT",
+    "JPY": "Yen ↓ → USDJPY LONG; Nikkei eher stärker",
+    "CAD": "CAD ↓ → USDCAD LONG",
+    "AUD": "AUD ↓ → AUDUSD SHORT",
+    "NZD": "NZD ↓ → NZDUSD SHORT",
+    "CHF": "Franken ↓ → USDCHF LONG",
+    "CNY": "schwache China-Daten → AUDUSD SHORT, Rohstoffe/Öl eher SHORT",
+}
+
+
+def brief_expect(ccy, title):
+    """Zeilen mit der typischen Reaktion bei Ergebnis über/unter Prognose."""
+    t = (title or "").lower()
+    kind = next((k for k, words in BRIEF_KIND if any(w in t for w in words)), None)
+    up, dn = BRIEF_CCY_UP.get(ccy), BRIEF_CCY_DOWN.get(ccy)
+    if not kind or not up:
+        return ["   📈📉 Richtung hängt vom Ergebnis ab, keine eindeutige Lehrbuch-Reaktion."]
+    if kind == "policy":
+        return [f"   🦅 strenger als erwartet (höherer Zins / „hawkish“): {up}",
+                f"   🕊 lockerer als erwartet (tieferer Zins / „dovish“): {dn}"]
+    if kind == "inverse":
+        hi, lo = dn, up                          # mehr Arbeitslose = schwächere Wirtschaft = Währung schwächer
+    else:
+        hi, lo = up, dn
+    extra = ""
+    if ccy == "USD" and kind == "growth":
+        extra = " (Aktien teils uneinheitlich: starke Wirtschaft ist gut, aber weniger Zinssenkungen)"
+    if ccy == "USD" and kind == "inverse":
+        extra = " (Aktien teils uneinheitlich: Zinssenkungs-Hoffnung vs. Konjunktursorge)"
+    return [f"   ⬆️ höher als Prognose: {hi}{extra if kind != 'inverse' else ''}",
+            f"   ⬇️ niedriger als Prognose: {lo}{extra if kind == 'inverse' else ''}"]
+
+
+def brief_events(now):
+    """Termine des Tages (deutsche Zeit) aus dem Wochenkalender: High Impact + Feiertage."""
+    r = requests.get(CAL_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    today = pd.Timestamp(now).tz_convert(BRIEF_TZ).date()
+    out = []
+    for e in r.json():
+        imp = e.get("impact")
+        if imp not in ("High", "Holiday"):
+            continue
+        try:
+            t = pd.Timestamp(e["date"]).tz_convert(BRIEF_TZ)
+        except Exception:
+            continue
+        if t.date() != today:
+            continue
+        out.append({"t": t, "ccy": e.get("country", ""), "title": e.get("title", ""), "impact": imp,
+                    "forecast": e.get("forecast", ""), "previous": e.get("previous", "")})
+    return sorted(out, key=lambda x: (x["t"], x["ccy"]))
+
+
+def brief_text(now):
+    loc = pd.Timestamp(now).tz_convert(BRIEF_TZ)
+    days = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+    head = f"🗓 Wichtige Termine heute ({days[loc.weekday()]}, {loc:%d.%m.}), Uhrzeiten deutsche Zeit"
+    try:
+        ev = brief_events(now)
+    except Exception as e:
+        return head + f"\n\n⚠️ Wirtschaftskalender nicht erreichbar ({scrub(e)[:80]}). Bitte selbst prüfen, z. B. bei forexfactory.com."
+    hol = [e for e in ev if e["impact"] == "Holiday"]
+    hi = [e for e in ev if e["impact"] == "High"]
+    lines = [head, ""]
+    if not hi:
+        lines.append("Heute keine High-Impact-Termine laut Kalender. Trotzdem können Reden oder Nachrichten überraschen.")
+    groups = {}
+    for e in hi:
+        groups.setdefault(e["t"], []).append(e)
+    blocks, ccys_all = [], set()
+    for t, es in groups.items():
+        ccys = sorted({e["ccy"] for e in es})
+        ccys_all.update(ccys)
+        for e in es:
+            fc = ""
+            if e["forecast"] or e["previous"]:
+                fc = f" (Prognose {e['forecast'] or '–'}, zuvor {e['previous'] or '–'})"
+            all_day = t.hour == 0 and t.minute == 0
+            lines.append(f"{'ganztägig' if all_day else t.strftime('%H:%M')}  {BRIEF_FLAG.get(e['ccy'], '🌐')} "
+                         f"{e['ccy']} {e['title']}{fc}")
+            lines += brief_expect(e["ccy"], e["title"])
+        lines.append("   betrifft: " + "; ".join(BRIEF_MARKETS.get(c, c) for c in ccys))
+        if not (t.hour == 0 and t.minute == 0):
+            a, b = t - pd.Timedelta(minutes=BLACKOUT_MIN), t + pd.Timedelta(minutes=BLACKOUT_MIN)
+            lines.append(f"   ⛔ besser nicht handeln: {a:%H:%M}–{b:%H:%M}")
+            blocks.append((a, b))
+        lines.append("")
+    if blocks:
+        merged = []
+        for a, b in sorted(blocks):
+            if merged and a <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+            else:
+                merged.append((a, b))
+        lines.append("⛔ Sperrzeiten heute: " + ", ".join(f"{a:%H:%M}–{b:%H:%M}" for a, b in merged))
+    if hol:
+        lines.append("🏖 Feiertage: " + ", ".join(f"{BRIEF_FLAG.get(e['ccy'], '')} {e['ccy']} {e['title']}" for e in hol)
+                     + " (dünner Handel, Börsen evtl. geschlossen oder verkürzt)")
+    if "USD" in ccys_all:
+        lines.append("Hinweis: US-Termine bewegen fast alle Märkte, auch Gold und Krypto.")
+    if hi:
+        lines.append("Zu ⬆️/⬇️: typische Lehrbuch-Reaktion auf die ÜBERRASCHUNG gegenüber der Prognose, nicht garantiert. "
+                     "Je nach Marktlage dreht sie auch (z. B. „gute Daten = schlecht“, wenn auf Zinssenkungen gehofft wird), "
+                     "und die erste Bewegung ist oft ein Fehlausbruch. Kein Handelssignal.")
+    lines.append("Rund um diese Zeiten springen Kurse und Spreads oft stark; Stops können schlechter ausgeführt werden. "
+                 "Offene Trades vorher absichern oder schließen. Quelle: inoffizieller Wirtschaftskalender, ohne Gewähr.")
+    return "\n".join(lines)
+
+
+def brief_send(text, dry, chat=None):
+    """Lange Briefings an Leerzeilen in mehrere Telegram-Nachrichten teilen (Limit ca. 4000 Zeichen)."""
+    parts, cur = [], ""
+    for block in text.split("\n\n"):
+        if cur and len(cur) + len(block) + 2 > 3800:
+            parts.append(cur); cur = block
+        else:
+            cur = f"{cur}\n\n{block}" if cur else block
+    parts.append(cur)
+    for i, part in enumerate(parts):
+        telegram(part if i == 0 else f"🗓 (Fortsetzung {i + 1}/{len(parts)})\n\n{part}", dry, chat=chat)
+
+
+def brief_run(state, now, dry):
+    if str(env("MORNING_BRIEF", "1")) == "0":
+        return
+    loc = pd.Timestamp(now).tz_convert(BRIEF_TZ)
+    key = loc.strftime("%Y-%m-%d")
+    if loc.weekday() >= 5 or loc.hour < BRIEF_HOUR_LOCAL or state.get("_brief") == key:
+        return
+    try:
+        brief_send(brief_text(now), dry)
+        state["_brief"] = key
+    except Exception as e:
+        print(f"Morgen-Briefing fehlgeschlagen: {scrub(e)}")
+
+
 # ---------------- Hauptprogramm ----------------
 def main():
     ap = argparse.ArgumentParser()
@@ -1947,6 +2133,9 @@ def main():
     state = load_state()
     window = now.weekday() < 5 and FOREX_HOURS_UTC[0] <= now.hour < FOREX_HOURS_UTC[1]
     candidates, errors, frames, checked = [], 0, {}, 0
+
+    # Morgen-Briefing mit den Terminen des Tages (einmal pro Werktag ab 07:00 deutscher Zeit)
+    brief_run(state, now, a.dry)
 
     # Intraday: Gold, 1h-Kerzen, Tagestrend als Filter
     if window and env("TWELVEDATA_KEY"):
