@@ -829,6 +829,15 @@ def heartbeat(state, now, checked, errors, dry):
     if now.hour >= HEARTBEAT_HOUR_UTC and time.time() - state.get("hb", 0) > 20 * 3600:
         n = len(sent_recent(state, 24))
         try:
+            if env("SIGNALE", "0") != "1":
+                telegram("💚 Bot läuft (Prognose-Modus: keine Handelssignale).\n"
+                         f"{dxy_live_stats(state)}\n"
+                         "Morgens: Termine des Tages + DXY-Tagesprognose, montags zusätzlich Wochenprognose. "
+                         "15 Min. vor jedem High-Impact-Termin eine Erinnerung.\n"
+                         "Befehle: /news /dxy /hilfe\n"
+                         "Bleibt diese Nachricht aus: GitHub → Actions prüfen.", dry)
+                state["hb"] = time.time()
+                return
             mine = f"\n{stats_line(state, 'mine')}" if state.get("_stats_mine") else ""
             telegram(f"💚 Scanner läuft. Letzte 24h: {n} Meldung(en). Aktuell {checked} Märkte geprüft, {errors} Fehler, "
                      f"{len(state.get('_trades', []))} offene Meldung(en).\n{stats_line(state)}{mine}\n"
@@ -921,10 +930,12 @@ def update_trades(state, frames, now, dry):
 
 
 # ---------------- Befehle und Buttons ----------------
-HELP = ("Befehle:\n/status – offene Meldungen mit aktuellem Stand\n/bilanz – Auswertung\n/journal – abgeschlossene Meldungen als CSV\n"
+HELP = ("Befehle:\n/news – wichtige Termine heute (kommt auch jeden Werktag um 07:00)\n"
+        "/dxy – aktuelle DXY-Tagesprognose und Trefferquote (kommt auch jeden Werktag um 07:00, montags mit Wochenprognose)\n"
+        "\nNur wenn die Signale eingeschaltet sind (Variable SIGNALE=1):\n"
+        "/status – offene Meldungen mit aktuellem Stand\n/bilanz – Auswertung\n/journal – abgeschlossene Meldungen als CSV\n"
         "/demo – Demo-Signale: offene Positionen und Bilanz\n"
         "/meme – Memecoin-Radar: Live-Test-Auswertung\n"
-        "/news – wichtige Termine heute (kommt auch jeden Werktag um 07:00)\n"
         "/rein <Nr> – Meldung als deinen Trade markieren\n/raus <Nr> – Meldung als nicht genommen markieren\n"
         "(Die Buttons unter jeder Meldung machen dasselbe.)\n"
         "Hinweis: Der Scanner liest Befehle nur bei jedem Lauf, die Antwort kommt also mit Verzögerung.")
@@ -1005,6 +1016,11 @@ def process_updates(state, frames, now, dry, updates=None):
                     telegram(status_text(state, frames), dry, chat=chat)
                 elif cmd == "/bilanz":
                     telegram(stats_text(state), dry, chat=chat)
+                elif cmd in ("/dxy", "/prognose"):
+                    try:
+                        telegram(dxy_now_text(state, now), dry, chat=chat)
+                    except Exception as e:
+                        telegram(f"DXY-Prognose gerade nicht verfügbar ({scrub(e)[:120]}).", dry, chat=chat)
                 elif cmd in ("/news", "/termine"):
                     brief_send(brief_text(now), dry, chat=chat)
                 elif cmd == "/meme":
@@ -1702,10 +1718,18 @@ MEME_SKIP = {"WETH", "ETH", "USDC", "USDT", "DAI", "CBBTC", "WBTC", "CBETH", "WS
 
 
 def meme_get(url, params=None):
-    r = requests.get(url, params=params, timeout=20, headers={"Accept": "application/json"})
-    r.raise_for_status()
-    time.sleep(2.2)                     # GeckoTerminal: ca. 30 Abrufe pro Minute
-    return r.json()
+    """GeckoTerminal-Abruf. Bei 429 (zu viele Anfragen, GitHub teilt IP-Adressen) kurz warten und erneut versuchen."""
+    for attempt in range(3):
+        r = requests.get(url, params=params, timeout=20,
+                         headers={"Accept": "application/json;version=20230302", "User-Agent": "Mozilla/5.0"})
+        if r.status_code == 429 and attempt < 2:
+            wait = min(float(r.headers.get("Retry-After") or 0) or 15 * (attempt + 1), 40)
+            print(f"[Meme] GeckoTerminal: zu viele Anfragen, warte {wait:.0f} s")
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        time.sleep(2.2)                 # GeckoTerminal: ca. 30 Abrufe pro Minute
+        return r.json()
 
 
 def meme_num(x, default=0.0):
@@ -1892,9 +1916,13 @@ def meme_run(state, now, dry):
     # 2) Neue Kandidaten suchen
     try:
         pools = meme_pools(now)
+        d["fails"] = 0
     except Exception as e:
-        print(f"[Meme] GeckoTerminal nicht erreichbar: {scrub(e)}")
-        alert_error(state, "meme-gt", f"Memecoin-Radar: GeckoTerminal nicht erreichbar ({scrub(e)[:120]})", dry)
+        d["fails"] = d.get("fails", 0) + 1
+        print(f"[Meme] GeckoTerminal nicht erreichbar ({d['fails']}x in Folge): {scrub(e)}")
+        if d["fails"] >= 6:              # erst nach ca. 1 Stunde Ausfall melden, einzelne Aussetzer sind normal
+            alert_error(state, "meme-gt", f"Memecoin-Radar: GeckoTerminal seit ca. {d['fails'] * 10} Min. nicht "
+                                          f"erreichbar ({scrub(e)[:100]}). Der Radar versucht es weiter.", dry)
         return errors + 1
     cands = []
     for p in pools:
@@ -2119,6 +2147,417 @@ def brief_run(state, now, dry):
         print(f"Morgen-Briefing fehlgeschlagen: {scrub(e)}")
 
 
+# ================= DXY-Prognose (Tag und Woche) mit Makrodaten =================
+# Keine Handelssignale, sondern eine regelbasierte Einschätzung, ob der Dollar-Index (DXY) eher steigt oder fällt.
+# DXY wird nach der offiziellen ICE-Formel aus 6 Währungspaaren berechnet (Twelve Data).
+# Makrodaten (alle kostenlos): US-Zinsen, Realzinsen, VIX (FRED), Euro-Zinsen (EZB), Positionierung (CFTC/COT).
+# Ehrliche Auswahl: Jeder Faktor wird auf der ERSTEN Hälfte der Geschichte geprüft; nur wer dort besser als 50 % lag,
+# zählt. Die Trefferquote des Gesamtmodells wird NUR auf der zweiten Hälfte gemessen (Daten, die die Auswahl nicht
+# kannte). Live zählt der Bot zusätzlich mit (/dxy). Abschalten: Variable DXY_PROGNOSE=0.
+DXY_PAIRS = {"EUR/USD": -0.576, "USD/JPY": 0.136, "GBP/USD": -0.119, "USD/CAD": 0.091, "USD/SEK": 0.042, "USD/CHF": 0.036}
+DXY_CONST = 50.14348112
+DXY_HISTORY = 1600                # Tageskerzen (ca. 6 Jahre)
+DXY_WARMUP = {"tag": 60, "woche": 25}
+DXY_MIN_N = {"tag": 30, "woche": 12}
+DXY_MIN_HIT = 0.52                # Faktor zählt nur, wenn er in der 1. Hälfte mind. 52 % richtig lag
+DXY_ECB_2Y = "https://data-api.ecb.europa.eu/service/data/YC/B.U2.EUR.4F.G_N_A.SV_C_YM.SR_2Y"
+DXY_CFTC = "https://publicreporting.cftc.gov/resource/6dca-aqww.json"
+DXY_COT_CODE = "098662"           # USD INDEX - ICE FUTURES U.S.
+DXY_USD_EFFECT = {1: "Dollar ↑ → EURUSD/GBPUSD eher SHORT, USDJPY eher LONG, Gold eher SHORT, Nasdaq/S&P eher SHORT",
+                  -1: "Dollar ↓ → EURUSD/GBPUSD eher LONG, USDJPY eher SHORT, Gold eher LONG, Nasdaq/S&P eher LONG"}
+
+
+def dxy_daily():
+    """DXY-Tagesschlusskurse aus den 6 Paaren (inkl. laufender Kerze)."""
+    logs = []
+    for i, (sym, w) in enumerate(DXY_PAIRS.items()):
+        if i:
+            time.sleep(8)                                   # Twelve Data: max. 8 Abrufe pro Minute
+        df = fetch_twelve_tf(sym, "1day", DXY_HISTORY, drop_last=False)
+        s = df.set_index(df.time.dt.normalize())["close"]
+        logs.append(w * np.log(s[~s.index.duplicated(keep="last")]))
+    lp = pd.concat(logs, axis=1).dropna()
+    return (DXY_CONST * np.exp(lp.sum(axis=1))).rename("dxy")
+
+
+def dxy_fred(sid, days=3000):
+    key = env("FRED_API_KEY")
+    if not key:
+        return None
+    r = requests.get("https://api.stlouisfed.org/fred/series/observations",
+                     params={"series_id": sid, "api_key": key, "file_type": "json",
+                             "observation_start": (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")},
+                     timeout=30)
+    r.raise_for_status()
+    d = pd.DataFrame(r.json()["observations"])
+    return pd.Series(pd.to_numeric(d["value"], errors="coerce").values,
+                     index=pd.to_datetime(d["date"], utc=True)).dropna()
+
+
+def dxy_ecb_2y(days=3000):
+    start = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    r = requests.get(DXY_ECB_2Y, params={"format": "csvdata", "startPeriod": start}, timeout=40,
+                     headers={"Accept": "text/csv", "User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    d = pd.read_csv(io.StringIO(r.text))
+    return pd.Series(pd.to_numeric(d["OBS_VALUE"], errors="coerce").values,
+                     index=pd.to_datetime(d["TIME_PERIOD"], utc=True)).dropna().sort_index()
+
+
+def dxy_cot():
+    """Netto-Position der Spekulanten (Non-Commercials) im Dollar-Index-Future, verfügbar ab Freitag nach dem Stichtag."""
+    r = requests.get(DXY_CFTC, params={"$where": f"cftc_contract_market_code='{DXY_COT_CODE}'",
+                                       "$order": "report_date_as_yyyy_mm_dd", "$limit": 2000}, timeout=40)
+    r.raise_for_status()
+    d = pd.DataFrame(r.json())
+    if d.empty:
+        return None
+    net = pd.to_numeric(d["noncomm_positions_long_all"]) - pd.to_numeric(d["noncomm_positions_short_all"])
+    idx = pd.to_datetime(d["report_date_as_yyyy_mm_dd"], utc=True) + pd.Timedelta(days=3)   # Veröffentlichung Freitag
+    return pd.Series(net.values, index=idx).sort_index()
+
+
+def dxy_macro():
+    """Alle Makroreihen; was nicht erreichbar ist, fehlt einfach (None)."""
+    m = {}
+    for name, fn in (("us2y", lambda: dxy_fred("DGS2")), ("real10", lambda: dxy_fred("DFII10")),
+                     ("vix", lambda: dxy_fred("VIXCLS")), ("eu2y", dxy_ecb_2y), ("cot", dxy_cot)):
+        try:
+            m[name] = fn()
+        except Exception as e:
+            print(f"[DXY] Makrodaten {name} nicht verfügbar: {scrub(e)}")
+            m[name] = None
+    return m
+
+
+def dxy_rsi(c, n):
+    ch = c.diff()
+    up = ch.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    dn = (-ch.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    return 100 - 100 / (1 + up / dn.replace(0, np.nan))
+
+
+def dxy_structure(c, k=3):
+    """+1 höhere Hochs und Tiefs, -1 tiefere, 0 unklar (Swings auf Schlusskursen, nur bestätigte)."""
+    v = c.values
+    out = np.zeros(len(v), int)
+    highs, lows = [], []
+    for t in range(len(v)):
+        j = t - k
+        if j >= k:
+            win = v[j - k:j + k + 1]
+            if v[j] == win.max():
+                highs.append(v[j])
+            elif v[j] == win.min():
+                lows.append(v[j])
+        if len(highs) >= 2 and len(lows) >= 2:
+            if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
+                out[t] = 1
+            elif highs[-1] < highs[-2] and lows[-1] < lows[-2]:
+                out[t] = -1
+    return pd.Series(out, index=c.index)
+
+
+def _sig(x, hi, lo=None):
+    lo = -hi if lo is None else lo
+    return np.where(x > hi, 1, np.where(x < lo, -1, 0))
+
+
+def _align(s, idx):
+    return None if s is None or not len(s) else s.reindex(s.index.union(idx)).ffill().reindex(idx)
+
+
+def dxy_factors(c, m, kind):
+    """Faktoren je Kerze (nach ihrem Schluss bekannt): +1 Dollar eher hoch, -1 eher runter, 0 neutral."""
+    f = pd.DataFrame(index=c.index)
+    d, w = kind == "tag", kind == "woche"
+    # Technik
+    if d:
+        e20, e50 = c.ewm(span=20, adjust=False).mean(), c.ewm(span=50, adjust=False).mean()
+        f["Trend (EMA 20/50)"] = np.where((c > e20) & (c > e50), 1, np.where((c < e20) & (c < e50), -1, 0))
+        f["Struktur (Hochs/Tiefs)"] = dxy_structure(c).values
+        f["Momentum 5 Tage"] = _sig(c.pct_change(5) * 100, 0.3)
+        r2 = dxy_rsi(c, 2)
+        f["Überdehnung (RSI 2)"] = np.where(r2 > 90, -1, np.where(r2 < 10, 1, 0))
+    else:
+        s10, s20 = c.rolling(10).mean(), c.rolling(20).mean()
+        f["Trend (10/20 Wochen)"] = np.where((c > s10) & (c > s20), 1, np.where((c < s10) & (c < s20), -1, 0))
+        f["Momentum 4 Wochen"] = _sig(c.pct_change(4) * 100, 0.5)
+        f["Vorwoche"] = _sig(c.pct_change() * 100, 0.2)
+    lag, bp = (10, 10) if d else (4, 15)
+    per = "10 Tage" if d else "4 Wochen"
+    # Zinsen: Differenz USA - Euroraum (falls EZB-Daten da), sonst nur USA
+    us, eu = _align(m.get("us2y"), c.index), _align(m.get("eu2y"), c.index)
+    if us is not None and eu is not None:
+        sp = us - eu
+        f[f"Zinsdifferenz USA−Euro 2 J. ({per})"] = _sig((sp - sp.shift(lag)) * 100, bp)
+    elif us is not None:
+        f[f"US-Zinsen 2 J. ({per})"] = _sig((us - us.shift(lag)) * 100, bp)
+    real = _align(m.get("real10"), c.index)
+    if real is not None:
+        f[f"Realzinsen USA 10 J. ({per})"] = _sig((real - real.shift(lag)) * 100, bp)
+    vix = _align(m.get("vix"), c.index)
+    if vix is not None:
+        n_v, thr = (5, 15) if d else (4, 20)
+        f[f"Risikostimmung VIX ({'5 Tage' if d else '4 Wochen'})"] = _sig(vix.pct_change(n_v) * 100, thr)
+    if w and m.get("cot") is not None and len(m["cot"]) > 60:
+        cot = m["cot"]
+        pct = cot.rolling(156, min_periods=52).apply(lambda x: (x[:-1] < x[-1]).mean() if len(x) > 1 else np.nan, raw=True)
+        pa = _align(pct, c.index)
+        f["Positionierung Spekulanten (COT, Gegenindikator)"] = np.where(pa > 0.9, -1, np.where(pa < 0.1, 1, 0))
+    return f.fillna(0).astype(int)
+
+
+def _hits(sig, nxt, mask):
+    m = mask & (sig != 0) & nxt.notna() & (nxt != 0)
+    n = int(m.sum())
+    return n, (float((sig[m] == nxt[m]).mean()) if n else np.nan)
+
+
+def dxy_evaluate(f, c, kind):
+    """Faktorauswahl auf der 1. Hälfte, Test des Gesamtmodells auf der 2. Hälfte."""
+    nxt = pd.Series(np.sign(c.shift(-1) - c), index=c.index)
+    valid = pd.Series(np.arange(len(c)) >= DXY_WARMUP[kind], index=c.index) & nxt.notna()
+    vidx = valid[valid].index
+    if len(vidx) < 2 * DXY_MIN_N[kind]:
+        return None
+    split = vidx[len(vidx) // 2]
+    first, second = valid & (c.index < split), valid & (c.index >= split)
+    stats, active = {}, []
+    for col in f.columns:
+        n1, h1 = _hits(f[col], nxt, first)
+        n2, h2 = _hits(f[col], nxt, second)
+        stats[col] = (n1, h1, n2, h2)
+        if n1 >= DXY_MIN_N[kind] and h1 >= DXY_MIN_HIT:
+            active.append(col)
+    thr = 2 if len(active) >= 4 else 1
+    score = f[active].sum(axis=1) if active else pd.Series(0, index=c.index)
+    bias = pd.Series(np.where(score >= thr, 1, np.where(score <= -thr, -1, 0)), index=c.index)
+    n_t, h_t = _hits(bias, nxt, second)
+    up = float((nxt[second & (nxt != 0)] > 0).mean())
+    z = (h_t - 0.5) / np.sqrt(0.25 / n_t) if n_t else 0.0
+    return {"stats": stats, "active": active, "thr": thr, "n": n_t, "hit": h_t, "up": up, "z": z,
+            "split": split.strftime("%Y-%m-%d"), "start": vidx[0].strftime("%Y-%m-%d")}
+
+
+def dxy_compute(now):
+    c_all = dxy_daily()
+    today = pd.Timestamp(now).normalize()
+    c = c_all[c_all.index < today]                          # nur abgeschlossene Tage
+    m = dxy_macro()
+    cw = c.resample("W-FRI").last().dropna()
+    if len(cw) and cw.index[-1] > c.index[-1]:              # laufende Woche nicht als abgeschlossen werten
+        cw = cw.iloc[:-1]
+    fd, fw = dxy_factors(c, m, "tag"), dxy_factors(cw, m, "woche")
+    return {"c": c, "cw": cw, "fd": fd, "fw": fw, "now_val": float(c_all.iloc[-1]),
+            "ev_d": dxy_evaluate(fd, c, "tag"), "ev_w": dxy_evaluate(fw, cw, "woche"),
+            "missing": [k for k, v in m.items() if v is None]}
+
+
+def dxy_bias_now(f, ev):
+    if not ev or not ev["active"]:
+        return 0, 0
+    score = int(f[ev["active"]].iloc[-1].sum())
+    return (1 if score >= ev["thr"] else -1 if score <= -ev["thr"] else 0), score
+
+
+def dxy_text(r, kind):
+    f = r["fd"] if kind == "tag" else r["fw"]
+    c = r["c"] if kind == "tag" else r["cw"]
+    ev = r["ev_d"] if kind == "tag" else r["ev_w"]
+    b, score = dxy_bias_now(f, ev)
+    head = {"tag": "📊 DXY-Tagesprognose", "woche": "📅 DXY-Wochenprognose"}[kind]
+    label = {1: "eher LONG ⬆️", -1: "eher SHORT ⬇️", 0: "NEUTRAL / unklar ↔️"}[b]
+    ref = "Vortagesschluss" if kind == "tag" else "Schluss Vorwoche"
+    lines = [f"{head}: {label}", f"DXY {ref}: {c.iloc[-1]:.2f} (aktuell ca. {r['now_val']:.2f})", "",
+             "Faktoren heute (✅ zählt, ➖ nur Info – im Rückblick nicht besser als Zufall oder zu selten):"]
+    sym = {1: "⬆️", -1: "⬇️", 0: "↔️"}
+    row = f.iloc[-1]
+    for k, v in row.items():
+        mark = "✅" if ev and k in ev["active"] else "➖"
+        q = ""
+        if ev and k in ev["stats"]:
+            n1, h1, n2, h2 = ev["stats"][k]
+            mn = DXY_MIN_N["tag" if kind == "tag" else "woche"]
+            q = f" (früher {h1:.0%}, zuletzt {h2:.0%})" if n1 >= mn and n2 >= mn else " (zu selten für eine Aussage)"
+        lines.append(f"  {mark} {sym[int(v)]} {k}{q}")
+    if ev and ev["active"]:
+        lines.append(f"  Summe der ✅-Faktoren: {score:+d} (ab +{ev['thr']} eher LONG, ab −{ev['thr']} eher SHORT)")
+    elif ev:
+        lines.append("  Kein Faktor war im Rückblick besser als Zufall → keine Richtung (NEUTRAL).")
+    else:
+        lines.append("  Zu wenig Kursdaten für eine Auswertung → NEUTRAL.")
+    if r["missing"]:
+        names = {"us2y": "US-Zinsen", "real10": "Realzinsen", "vix": "VIX", "eu2y": "Euro-Zinsen (EZB)", "cot": "COT"}
+        lines.append("  Nicht verfügbar: " + ", ".join(names.get(x, x) for x in r["missing"]))
+    if b:
+        lines += ["", "Was das bedeuten würde: " + DXY_USD_EFFECT[b]]
+    if ev and ev["n"]:
+        einheit = "Tage" if kind == "tag" else "Wochen"
+        lines += ["", f"Test auf ungesehenen Daten (seit {ev['split']}): Das Modell lag bei {ev['hit']:.0%} der {ev['n']} "
+                      f"{einheit} mit LONG/SHORT richtig. Münzwurf = 50 %; der DXY stieg an {ev['up']:.0%} der {einheit}."
+                      + (" Statistisch besser als Zufall." if ev["z"] >= 2 else " Das ist statistisch NICHT sicher besser als Zufall.")]
+    lines.append("Keine Anlageberatung. Eine Einschätzung, kein Signal: Wirtschaftsdaten und Nachrichten können alles drehen.")
+    return "\n".join(lines), b
+
+
+def dxy_week_events(now):
+    """Alle High-Impact-Termine der Woche, nach Tag gruppiert (deutsche Zeit)."""
+    r = requests.get(CAL_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    days = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+    out = {}
+    for e in r.json():
+        if e.get("impact") != "High":
+            continue
+        try:
+            t = pd.Timestamp(e["date"]).tz_convert(BRIEF_TZ)
+        except Exception:
+            continue
+        key = f"{days[t.weekday()]} {t:%d.%m.}"
+        out.setdefault((t.date(), key), []).append(
+            f"  {t:%H:%M} {BRIEF_FLAG.get(e.get('country', ''), '🌐')} {e.get('country', '')} {e.get('title', '')}")
+    lines = []
+    for (_, key), evs in sorted(out.items()):
+        lines.append(key)
+        lines += evs
+    return "\n".join(lines) if lines else "Keine High-Impact-Termine im Kalender."
+
+
+def dxy_track(state, r, now):
+    """Prognosen speichern und auswerten, sobald das Ergebnis feststeht."""
+    d = state.setdefault("_dxy", {"log": []})
+    c, cw = r["c"], r["cw"]
+    for p in d["log"]:
+        if p.get("ok") is not None:
+            continue
+        series = c if p["kind"] == "tag" else cw
+        after = series[series.index > pd.Timestamp(p["ref_date"], tz="UTC")]
+        if len(after):
+            move = float(after.iloc[0] - p["ref"])
+            p["ok"] = None if p["bias"] == 0 or move == 0 else bool(np.sign(move) == p["bias"])
+            p["move"] = round(move, 3)
+            p["done"] = True
+    del d["log"][:-500]
+
+
+def dxy_log(state, r, kind, bias, now):
+    d = state.setdefault("_dxy", {"log": []})
+    series = r["c"] if kind == "tag" else r["cw"]
+    d["log"].append({"kind": kind, "made": pd.Timestamp(now).strftime("%Y-%m-%d"), "bias": bias,
+                     "ref": float(series.iloc[-1]), "ref_date": series.index[-1].strftime("%Y-%m-%d"), "ok": None})
+
+
+def dxy_live_stats(state):
+    d = state.get("_dxy", {"log": []})
+    out = []
+    for kind, name in (("tag", "Tagesprognosen"), ("woche", "Wochenprognosen")):
+        done = [p for p in d["log"] if p["kind"] == kind and p.get("done") and p["bias"] != 0 and p.get("ok") is not None]
+        if done:
+            hit = sum(p["ok"] for p in done) / len(done)
+            out.append(f"{name} live: {sum(p['ok'] for p in done)} von {len(done)} richtig ({hit:.0%})")
+        else:
+            out.append(f"{name} live: noch keine ausgewertet")
+    return "\n".join(out)
+
+
+def dxy_run(state, now, dry):
+    """Werktags ab 07:00 deutscher Zeit: Tagesprognose, montags zusätzlich Wochenprognose."""
+    if str(env("DXY_PROGNOSE", "1")) == "0" or not env("TWELVEDATA_KEY"):
+        return 0
+    loc = pd.Timestamp(now).tz_convert(BRIEF_TZ)
+    key = loc.strftime("%Y-%m-%d")
+    if loc.weekday() >= 5 or loc.hour < BRIEF_HOUR_LOCAL or state.get("_dxy_sent") == key:
+        return 0
+    try:
+        r = dxy_compute(now)
+    except Exception as e:
+        print(f"[DXY] Prognose fehlgeschlagen: {scrub(e)}")
+        alert_error(state, "dxy", f"DXY-Prognose: Kursdaten nicht verfügbar ({scrub(e)[:120]})", dry)
+        return 1
+    try:
+        dxy_track(state, r, now)
+    except Exception as e:
+        print(f"[DXY] Auswertung alter Prognosen fehlgeschlagen: {scrub(e)}")
+    if loc.weekday() == 0:
+        txt, b = dxy_text(r, "woche")
+        try:
+            events = dxy_week_events(now)
+        except Exception as e:
+            events = f"Kalender nicht erreichbar ({scrub(e)[:60]})"
+        brief_send(txt + "\n\n🗓 High-Impact-Termine diese Woche (deutsche Zeit):\n" + events, dry)
+        dxy_log(state, r, "woche", b, now)
+    txt, b = dxy_text(r, "tag")
+    telegram(txt + "\n\n" + dxy_live_stats(state), dry)
+    dxy_log(state, r, "tag", b, now)
+    state["_dxy_sent"] = key
+    return 0
+
+
+def dxy_now_text(state, now):
+    """Für /dxy: aktuelle Tagesprognose plus Live-Bilanz (rechnet neu, kostet 6 Datenabrufe)."""
+    r = dxy_compute(now)
+    txt, _ = dxy_text(r, "tag")
+    return txt + "\n\n" + dxy_live_stats(state)
+
+
+# ================= Termin-Erinnerung kurz vor High-Impact-News =================
+REMIND_MIN = 15
+
+
+def news_calendar_cached(state, now):
+    """Wochenkalender höchstens alle 3 Stunden neu laden (schont die kostenlose Quelle)."""
+    c = state.get("_cal")
+    if c and time.time() - c.get("t", 0) < 3 * 3600:
+        return c["events"]
+    r = requests.get(CAL_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    ev = [{"date": e["date"], "ccy": e.get("country", ""), "title": e.get("title", ""),
+           "forecast": e.get("forecast", ""), "previous": e.get("previous", "")}
+          for e in r.json() if e.get("impact") == "High"]
+    state["_cal"] = {"t": time.time(), "events": ev}
+    return ev
+
+
+def news_remind_run(state, now, dry):
+    if str(env("NEWS_ERINNERUNG", "1")) == "0":
+        return
+    try:
+        events = news_calendar_cached(state, now)
+    except Exception as e:
+        print(f"Termin-Erinnerung: Kalender nicht verfügbar: {scrub(e)}")
+        return
+    sent = state.setdefault("_reminded", {})
+    due = {}
+    for e in events:
+        try:
+            t = pd.Timestamp(e["date"]).tz_convert("UTC")
+        except Exception:
+            continue
+        mins = (t - pd.Timestamp(now)).total_seconds() / 60
+        k = f"{e['date']}|{e['ccy']}|{e['title']}"
+        if 0 < mins <= REMIND_MIN + 10 and k not in sent and not (t.hour == 0 and t.minute == 0):
+            due.setdefault(t, []).append((k, e))
+    for t, items in sorted(due.items()):
+        loc = t.tz_convert(BRIEF_TZ)
+        lines = [f"⏰ In {int((t - pd.Timestamp(now)).total_seconds() // 60)} Min. ({loc:%H:%M} Uhr): High-Impact-News"]
+        ccys = set()
+        for k, e in items:
+            fc = f" (Prognose {e['forecast'] or '–'}, zuvor {e['previous'] or '–'})" if (e["forecast"] or e["previous"]) else ""
+            lines.append(f"{BRIEF_FLAG.get(e['ccy'], '🌐')} {e['ccy']} {e['title']}{fc}")
+            lines += brief_expect(e["ccy"], e["title"])
+            ccys.add(e["ccy"])
+            sent[k] = time.time()
+        lines.append("betrifft: " + "; ".join(BRIEF_MARKETS.get(c, c) for c in sorted(ccys)))
+        lines.append(f"⛔ besser nicht handeln: {loc - pd.Timedelta(minutes=BLACKOUT_MIN):%H:%M}–"
+                     f"{loc + pd.Timedelta(minutes=BLACKOUT_MIN):%H:%M}. Offene Trades absichern.")
+        try:
+            telegram("\n".join(lines), dry)
+        except Exception as e:
+            print(f"Termin-Erinnerung fehlgeschlagen: {scrub(e)}")
+    state["_reminded"] = {k: v for k, v in sent.items() if time.time() - v < 8 * 86400}
+
+
 # ---------------- Hauptprogramm ----------------
 def main():
     ap = argparse.ArgumentParser()
@@ -2134,11 +2573,21 @@ def main():
     window = now.weekday() < 5 and FOREX_HOURS_UTC[0] <= now.hour < FOREX_HOURS_UTC[1]
     candidates, errors, frames, checked = [], 0, {}, 0
 
+    # Prognose-Modus: Handelssignale nur, wenn Variable SIGNALE=1 gesetzt ist
+    signals_on = env("SIGNALE", "0") == "1"
+
     # Morgen-Briefing mit den Terminen des Tages (einmal pro Werktag ab 07:00 deutscher Zeit)
     brief_run(state, now, a.dry)
+    # DXY-Prognose: werktags ab 07:00 deutscher Zeit, montags zusätzlich Wochenprognose
+    try:
+        errors += dxy_run(state, now, a.dry)
+    except Exception as e:
+        print(f"DXY-Prognose fehlgeschlagen: {scrub(e)}")
+    # Erinnerung 15 Minuten vor jedem High-Impact-Termin
+    news_remind_run(state, now, a.dry)
 
     # Intraday: Gold, 1h-Kerzen, Tagestrend als Filter
-    if window and env("TWELVEDATA_KEY"):
+    if signals_on and window and env("TWELVEDATA_KEY"):
         for name, ts in INTRADAY.items():
             checked += 1
             try:
@@ -2157,7 +2606,8 @@ def main():
                 errors += 1
                 print(f"[{name}] Fehler: {scrub(e)}")
                 alert_error(state, name, f"{name}: {scrub(e)[:150]}", a.dry)
-    print(f"{now:%H:%M} UTC: {checked} Intraday-Märkte geprüft, {errors} Fehler, {len(candidates)} neue Kandidaten")
+    print(f"{now:%H:%M} UTC: Modus {'Signale' if signals_on else 'Prognose'}, {checked} Intraday-Märkte geprüft, "
+          f"{errors} Fehler, {len(candidates)} neue Kandidaten")
 
     try:
         process_updates(state, frames, now, a.dry)
@@ -2191,7 +2641,7 @@ def main():
                 print(f"Info-Meldung fehlgeschlagen: {scrub(e)}")
 
     # Swing: einmal täglich ab 07:00 UTC
-    if now.hour >= SWING_HOUR_UTC:
+    if signals_on and now.hour >= SWING_HOUR_UTC:
         try:
             errors += swing_run(state, now, a.dry)
             checked += len(SWING)
@@ -2199,16 +2649,18 @@ def main():
             print(f"Swing-Lauf fehlgeschlagen: {scrub(e)}")
 
     # Demo-Signale (ORB, Momentum, Mean Reversion auf Nasdaq/S&P 500), nur Demokonto
-    try:
-        errors += demo_run(state, now, a.dry, telegram, alert_error, env)
-    except Exception as e:
-        print(f"Demo-Lauf fehlgeschlagen: {scrub(e)}")
+    if signals_on:
+        try:
+            errors += demo_run(state, now, a.dry, telegram, alert_error, env)
+        except Exception as e:
+            print(f"Demo-Lauf fehlgeschlagen: {scrub(e)}")
 
     # Memecoin-Radar (Base), rund um die Uhr, Spielgeld
-    try:
-        errors += meme_run(state, now, a.dry)
-    except Exception as e:
-        print(f"Memecoin-Radar fehlgeschlagen: {scrub(e)}")
+    if signals_on:
+        try:
+            errors += meme_run(state, now, a.dry)
+        except Exception as e:
+            print(f"Memecoin-Radar fehlgeschlagen: {scrub(e)}")
 
     heartbeat(state, now, checked, errors, a.dry)
     save_state(state)
